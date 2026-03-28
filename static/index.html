@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TAT & Batch Monitoring System</title>
+    <meta name="description" content="Automated TAT and Batch Monitoring System for Laboratory Tests">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+    <!-- Toast Container -->
+    <div class="toast-container" id="toastContainer"></div>
+
+    <!-- Header -->
+    <header class="header">
+        <div class="header-inner">
+            <div class="logo">
+                <div class="logo-icon">🧬</div>
+                <div>
+                    <h1>TAT Monitor</h1>
+                    <p>Aspira Pathlab & Diagnostics</p>
+                </div>
+            </div>
+            <div class="header-actions">
+                <button class="notif-badge" id="notifBadge" onclick="toggleNotifications()">
+                    🔔 <span class="count" id="notifCount" style="display:none">0</span>
+                </button>
+                <button class="btn btn-sm btn-outline" onclick="refreshAll()">↻ Refresh</button>
+            </div>
+        </div>
+    </header>
+
+    <!-- Stats Bar -->
+    <div class="stats-bar" id="statsBar">
+        <div class="stat-card info">
+            <div class="stat-label">Test Catalog</div>
+            <div class="stat-value" id="statCatalog">—</div>
+        </div>
+        <div class="stat-card accent">
+            <div class="stat-label">Active Samples</div>
+            <div class="stat-value" id="statActive">0</div>
+        </div>
+        <div class="stat-card warning">
+            <div class="stat-label">Missed Batches</div>
+            <div class="stat-value" id="statMissed">0</div>
+        </div>
+        <div class="stat-card success">
+            <div class="stat-label">Total Tracked</div>
+            <div class="stat-value" id="statTotal">0</div>
+        </div>
+    </div>
+
+    <!-- Main Content -->
+    <div class="main-content">
+        <!-- Left Column -->
+        <div class="left-col">
+            <!-- Test Search + Accession Card -->
+            <div class="card" id="searchCard">
+                <div class="card-header">
+                    <h2>🔍 Test Search & Accession</h2>
+                </div>
+                <div class="card-body">
+                    <div class="search-wrapper">
+                        <span class="search-icon">⌕</span>
+                        <input type="text" id="searchInput" placeholder="Search by test name or code..." 
+                               oninput="debounceSearch()" autocomplete="off">
+                    </div>
+
+                    <!-- Selected Test Info -->
+                    <div id="selectedTestArea" style="display:none; margin-top:1rem;">
+                        <div class="selected-test-info" id="selectedTestInfo"></div>
+                        <div class="eta-display" id="etaPreview" style="display:none;"></div>
+                        <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:0.8rem;">
+                            <div class="form-group" style="flex:1; margin-bottom:0;">
+                                <label>Accession Time (optional)</label>
+                                <input type="datetime-local" id="accessionTimeInput">
+                            </div>
+                            <div style="display:flex; align-items:flex-end;">
+                                <button class="btn btn-primary" id="accessionBtn" onclick="accessionSample()">
+                                    🧪 Accession Sample
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Test List -->
+                    <div class="test-list" id="testList">
+                        <div class="loading"><div class="spinner"></div> Loading tests...</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Active Samples -->
+            <div class="card" style="margin-top:1.5rem;">
+                <div class="card-header">
+                    <h2>📦 Active Samples</h2>
+                    <button class="btn btn-sm btn-outline" onclick="loadSamples()">Refresh</button>
+                </div>
+                <div class="card-body" style="padding: 0.5rem 0;">
+                    <div class="samples-table-wrapper">
+                        <table class="samples-table" id="samplesTable">
+                            <thead>
+                                <tr>
+                                    <th>Sample ID</th>
+                                    <th>Test</th>
+                                    <th>Accession</th>
+                                    <th>Batch</th>
+                                    <th>ETA</th>
+                                    <th>Status</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="samplesBody">
+                                <tr><td colspan="7"><div class="empty-state"><div class="empty-icon">📭</div><p>No samples yet. Accession a test to get started.</p></div></td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Right Column: Notifications -->
+        <div class="right-col">
+            <div class="card">
+                <div class="card-header">
+                    <h2>🔔 Notifications</h2>
+                    <span id="notifHeaderCount" style="font-size:0.75rem; color:var(--text-muted);">0 alerts</span>
+                </div>
+                <div class="card-body" style="padding: 1rem;">
+                    <div class="notif-list" id="notifList">
+                        <div class="empty-state">
+                            <div class="empty-icon">🔕</div>
+                            <p>No notifications yet</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Quick Info Card -->
+            <div class="card" style="margin-top:1.5rem;">
+                <div class="card-header">
+                    <h2>ℹ️ How It Works</h2>
+                </div>
+                <div class="card-body" style="font-size:0.82rem; color:var(--text-secondary); line-height:1.7;">
+                    <p><strong>1.</strong> Search for a test in the catalog</p>
+                    <p><strong>2.</strong> Click on a test to select it</p>
+                    <p><strong>3.</strong> Optionally set an accession time</p>
+                    <p><strong>4.</strong> Click <em>Accession Sample</em> to register</p>
+                    <p><strong>5.</strong> The system calculates the next batch and ETA</p>
+                    <p><strong>6.</strong> Simulate a "Missed Batch" to see rescheduling</p>
+                    <p style="margin-top:1rem; padding-top:0.8rem; border-top:1px solid var(--border-glass); color:var(--text-muted); font-size:0.75rem;">
+                        Also available via CLI:<br>
+                        <code style="color:var(--accent-secondary);">python cli.py search "vitamin"</code><br>
+                        <code style="color:var(--accent-secondary);">python cli.py accession ELISA023</code>
+                    </p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Notification Modal -->
+    <div class="modal-overlay" id="notifModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3>🔔 Notification Details</h3>
+                <button class="modal-close" onclick="closeModal()">&times;</button>
+            </div>
+            <div class="modal-body" id="notifModalBody"></div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
