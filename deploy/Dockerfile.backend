@@ -1,0 +1,55 @@
+# ── Aspira TAT — Backend / Celery ───────────────────────────────────────────
+# Serves: FastAPI (uvicorn), Celery worker, Celery beat
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Stage 1: Builder ────────────────────────────────────────────────────────
+FROM python:3.11-slim AS builder
+
+# System deps: libpq for psycopg2 SSL, gcc for compiled packages
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq-dev \
+    gcc \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install Python deps into a virtualenv or just the system site-packages
+# Using --user to keep things separate if needed, or just install globally in slim
+COPY requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+# ── Stage 2: Final Runner ───────────────────────────────────────────────────
+FROM python:3.11-slim AS runner
+
+# We still need libpq for the runtime (psycopg2)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy installed deps from builder
+COPY --from=builder /install /usr/local
+
+# Copy App source
+# Note: components/ is mostly frontend, but if shared logic exists, include it.
+# Based on current structure, app/ contains the core logic.
+COPY app/        ./app/
+COPY config/     ./config/
+COPY database/   ./database/
+COPY edos.csv    ./edos.csv
+
+# ── Runtime env defaults ─────────────────────────────────────────────────────
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TZ=Asia/Kolkata \
+    PYTHONPATH=/app
+
+# Expose FastAPI port
+EXPOSE 8000
+
+# Default command = FastAPI (override in docker-compose for worker / beat)
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+

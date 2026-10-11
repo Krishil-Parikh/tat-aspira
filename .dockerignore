@@ -1,0 +1,47 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# ── Node / Next.js ────────────────────────────────────────────────────────────
+node_modules/
+.next/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ── Git & IDE ─────────────────────────────────────────────────────────────────
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# ── Celery runtime artifacts ──────────────────────────────────────────────────
+celerybeat-schedule.bak
+celerybeat-schedule.dat
+celerybeat-schedule.dir
+
+# ── Docs / SQL scripts (not needed in image) ──────────────────────────────────
+Documentation/
+db_schema.sql
+db_schema_pg.sql
+postgres_schema.sql
+full_setup_guide.md
+README.md
+
+# ── Secrets (never bake into image — inject via env_file) ────────────────────
+.env
+.env.*
+
+# ── OS noise ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.log

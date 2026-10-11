@@ -1,0 +1,125 @@
+/* --- fonts.css --- */
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+
+/* --- tailwind.css --- */
+@import 'tailwindcss' source(none);
+@source '../**/*.{js,ts,jsx,tsx}';
+
+/* --- theme.css --- */
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --font-size: 16px;
+  
+  /* Foundation: The Clinical Sanctuary Palette */
+  --background: #F6FAFF;
+  --foreground: #161C21;
+  
+  /* Surface hierarchy - Editorial warmth */
+  --surface-container-low: #EEF4FB;    /* sidebars / secondary */
+  --surface-container-lowest: #FFFFFF; /* primary work surfaces */
+  --surface-container-high: #E3E9F0;
+  
+  /* Clinical Precision */
+  --primary: #005DAC;
+  --primary-container: #1976D2;
+  --primary-foreground: #FFFFFF;
+  
+  /* Success states (Clinical Status Chips) */
+  --success-bg: #418340;
+  --success-text: #002203;
+  
+  /* Warning/Error states */
+  --error-bg: #FFDAD6;
+  --error-text: #93000A;
+  
+  /* UI Essentials */
+  --muted-foreground: #414752;
+  --border-ghost: rgba(193, 198, 212, 0.15); /* 15% opacity ghost border */
+  --radius: 1rem; /* xl = 16px or 1rem */
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-surface-low: var(--surface-container-low);
+  --color-surface-lowest: var(--surface-container-lowest);
+  --color-surface-high: var(--surface-container-high);
+  --color-primary: var(--primary);
+  --color-primary-container: var(--primary-container);
+  --color-success: var(--success-bg);
+  --color-success-text: var(--success-text);
+  --color-error: var(--error-bg);
+  --color-error-text: var(--error-text);
+  --color-muted: var(--muted-foreground);
+  --radius-xl: 1rem;
+  --radius-lg: 0.5rem;
+  --font-headline: 'Manrope', sans-serif;
+  --font-body: 'Plus Jakarta Sans', sans-serif;
+  --font-technical: 'JetBrains Mono', monospace;
+}
+
+@layer base {
+  * {
+    border-color: var(--border-ghost);
+    outline-color: rgba(0, 93, 172, 0.2);
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: var(--font-body);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  h1, h2, h3, .font-headline {
+    font-family: var(--font-headline);
+  }
+
+  .font-technical {
+    font-family: var(--font-technical);
+  }
+
+  html {
+    font-size: var(--font-size);
+    scroll-behavior: smooth;
+  }
+}
+
+/* --- Utilities --- */
+.glass {
+  background: rgba(255, 255, 255, 0.8);
+  backdrop-blur: 20px;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+}
+
+.tonal-card {
+  @apply bg-surface-lowest rounded-xl;
+  transition: background-color 0.2s ease;
+}
+
+.tonal-card:hover {
+  @apply bg-surface-low;
+}
+
+.tonal-transition {
+  background: linear-gradient(to bottom, var(--background), var(--surface-container-low));
+}
+
+.dashed-scanner {
+  background-image: url("data:image/svg+xml,%3csvg width='100%25' height='100%25' xmlns='http://www.w3.org/2000/svg'%3e%3crect width='100%25' height='100%25' fill='none' rx='12' ry='12' stroke='%231976D2FF' stroke-width='2' stroke-dasharray='8%2c 12' stroke-dashoffset='0' stroke-linecap='square'/%3e%3c/svg%3e");
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+}
+::-webkit-scrollbar-track {
+  @apply bg-background;
+}
+::-webkit-scrollbar-thumb {
+  @apply bg-surface-low rounded-full;
+}
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-surface-high;
+}

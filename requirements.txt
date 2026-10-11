@@ -1,0 +1,39 @@
+# Aspira TAT System v2 — Python Dependencies
+# Install: pip install -r requirements.txt
+# Python: 3.10+
+
+# ── Web framework ──────────────────────────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+gunicorn>=22.0.0
+
+# ── Async HTTP / serialisation ─────────────────────────────────────────────────
+httpx>=0.27.0
+orjson>=3.10.0              # fast JSON for Redis cache payloads
+
+# ── Data validation ────────────────────────────────────────────────────────────
+pydantic>=2.7.0
+pydantic-settings>=2.2.0   # optional — for Settings class via BaseSettings
+
+# ── Database — PostgreSQL ─────────────────────────────────────────────────────
+asyncpg>=0.29.0             # async driver for FastAPI routes (pg_database.py)
+psycopg2-binary>=2.9.9      # sync driver for Celery workers (webhook_processor.py)
+    
+# ── Cache & broker — Redis ────────────────────────────────────────────────────
+redis>=5.0.0                # hot pipeline cache + priority work queues
+
+# ── Task queue ────────────────────────────────────────────────────────────────
+celery>=5.4.0
+celery[redis]>=5.4.0        # Redis as Celery broker + result backend
+
+# ── Timezone / environment ────────────────────────────────────────────────────
+pytz>=2024.1
+python-dotenv>=1.0.0
+
+# ── EDOS catalog parsing ──────────────────────────────────────────────────────
+pandas>=2.2.0               # edos_loader.py reads EDOS CSV
+
+# ── REMOVED (MongoDB era — no longer needed) ──────────────────────────────────
+# pymongo>=4.7.0    — replaced by psycopg2-binary
+# motor>=3.4.0      — replaced by asyncpg
+# beanie>=1.25.0    — replaced by asyncpg ORM-free queries
