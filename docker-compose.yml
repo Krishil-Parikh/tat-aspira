@@ -1,0 +1,101 @@
+# ────────────────────────────────────────────────────────────────────────────
+# Aspira TAT System v2 — docker-compose.yml
+#
+# Services:
+#   backend    — FastAPI (uvicorn, port 8000)
+#   worker     — Celery worker (processes webhook events)
+#   beat       — Celery beat (periodic tasks: delayed-queue sweeper, etc.)
+#   frontend   — Next.js 15 (port 3000)
+#
+# Infrastructure:
+#   PostgreSQL — Neon (cloud)
+#   Redis      — Upstash (managed)
+# ────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── FastAPI Backend ────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.backend
+    container_name: aspira_backend
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount edos.csv for shared access; code is baked into image for production
+      - ./edos.csv:/app/edos.csv:ro
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8000
+      --workers 2
+      --log-level info
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 8s
+      retries: 5
+      start_period: 20s
+
+  # ── Celery Worker ──────────────────────────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.backend
+    container_name: aspira_worker
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    env_file: .env
+    command: >
+      celery -A app.workers.celery_app worker
+      --loglevel=info
+      --concurrency=4
+      --queues=queue:webhook-processing,queue:alert-processing,projection
+
+  # ── Celery Beat (Scheduler) ────────────────────────────────────────────────
+  beat:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.backend
+    container_name: aspira_beat
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    env_file: .env
+    # Beat stores its schedule in a DB file — persist it across restarts
+    volumes:
+      - beat_schedule:/app/celerybeat
+    command: >
+      celery -A app.workers.celery_app beat
+      --loglevel=info
+      --schedule=/app/celerybeat/celerybeat-schedule
+
+  # ── Next.js Frontend ───────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.frontend
+      args:
+        # The browser calls the backend via the host's localhost:8000
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+    container_name: aspira_frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      # Server-side rewrites inside the Docker network use the service name
+      INTERNAL_API_URL: http://backend:8000
+
+volumes:
+  beat_schedule:
