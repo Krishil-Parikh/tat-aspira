@@ -7,12 +7,42 @@
 #   beat       — Celery beat (periodic tasks: delayed-queue sweeper, etc.)
 #   frontend   — Next.js 15 (port 3000)
 #
-# Infrastructure:
-#   PostgreSQL — Neon (cloud)
-#   Redis      — Upstash (managed)
+#   db         — PostgreSQL 16 (internal only, data in the pgdata volume)
+#   redis      — Redis 7 (internal only)
+#
+# The app reaches them as db:5432 and redis:6379 (see .env). To use Neon / Upstash
+# instead, point DATABASE_URL / PG_DSN / REDIS_URL at them; db and redis then sit idle.
 # ────────────────────────────────────────────────────────────────────────────
 
 services:
+
+  # ── PostgreSQL ─────────────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: aspira_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PG_USER:-postgres}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:?set PG_PASSWORD in .env}
+      POSTGRES_DB: ${PG_DBNAME:-tat_db}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-postgres} -d ${PG_DBNAME:-tat_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: aspira_redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   # ── FastAPI Backend ────────────────────────────────────────────────────────
   backend:
@@ -21,6 +51,11 @@ services:
       dockerfile: deploy/Dockerfile.backend
     container_name: aspira_backend
     restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     env_file: .env
     ports:
       - "8000:8000"
@@ -84,7 +119,7 @@ services:
       args:
         # The browser calls the backend directly, so this is the server's public address.
         # Override with PUBLIC_API_URL in .env (e.g. http://localhost:8000 for local runs).
-        NEXT_PUBLIC_API_URL: ${PUBLIC_API_URL:-http://16.16.199.24:8000}
+        NEXT_PUBLIC_API_URL: ${PUBLIC_API_URL:-http://51.20.173.132:8000}
     container_name: aspira_frontend
     restart: unless-stopped
     depends_on:
@@ -100,3 +135,4 @@ services:
 
 volumes:
   beat_schedule:
+  pgdata:

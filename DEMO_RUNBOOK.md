@@ -9,14 +9,14 @@ which lab each test went to, when it arrived there, and its ETA.
 
 ---
 
-## 0. One-time setup on the server (`16.16.199.24`)
+## 0. One-time setup on the server (`51.20.173.132`)
 
 `.env` on the server must contain:
 
 ```ini
 DEMO_MODE=true            # unsigned webhooks, processed inline, Redis optional
 APP_ENV=development       # DEMO_MODE is refused when APP_ENV=production
-PUBLIC_API_URL=http://16.16.199.24:8000
+PUBLIC_API_URL=http://51.20.173.132:8000
 DATABASE_URL=...          # the demo database
 REDIS_URL=...             # optional in demo mode
 WEBHOOK_SHARED_SECRET=... # any value; signed requests are still verified
@@ -33,14 +33,14 @@ docker compose exec backend python database/init_demo.py    # 9-lab demo network
 Existing database that must not be wiped? Apply the two files in `database/migrations/`
 instead of `migrate.py`, then run `init_demo.py` only on a database with no bills yet.
 
-Dashboard: `http://16.16.199.24:3000` · API docs: `http://16.16.199.24:8000/docs`
+Dashboard: `http://51.20.173.132:3000` · API docs: `http://51.20.173.132:8000/docs`
 
 ## 1. Before you start (on the laptop you demo from)
 
 Works in Git Bash, macOS and Linux terminals.
 
 ```bash
-export API=http://16.16.199.24:8000
+export API=http://51.20.173.132:8000
 export B=101    # run number: use a new value for every fresh run (bill ids must be new)
 at() { date -u -d "+${1:-0} minutes" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v+${1:-0}M +%Y-%m-%dT%H:%M:%SZ; }
 T0=$(at 0)
