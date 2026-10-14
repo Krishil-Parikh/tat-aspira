@@ -76,6 +76,12 @@ class Settings:
     ALLOW_DOCTOR_SAMPLE_CREATE: bool = os.getenv("ALLOW_DOCTOR_SAMPLE_CREATE", "false").lower() == "true"
     SECRET_KEY: str = os.getenv("SECRET_KEY", "aspira-dev-secret-123")
 
+    # ── Demo mode ─────────────────────────────────────────────────────────────
+    # Live demos without CrelioHealth: unsigned webhooks accepted, webhooks processed
+    # inline in the API process (no Celery worker), Redis optional, receipt endpoints
+    # may name the tests received and back-date the receipt time. Refused in production.
+    DEMO_MODE: bool = os.getenv("DEMO_MODE", "false").lower() == "true"
+
     @property
     def IS_PRODUCTION(self) -> bool:
         return self.APP_ENV in {"prod", "production"}
@@ -89,6 +95,9 @@ if not cfg.DATABASE_URL:
 
 if cfg.IS_PRODUCTION and not cfg.WEBHOOK_SHARED_SECRET:
     raise RuntimeError("WEBHOOK_SHARED_SECRET is required in production.")
+
+if cfg.IS_PRODUCTION and cfg.DEMO_MODE:
+    raise RuntimeError("DEMO_MODE must not be enabled in production (it accepts unsigned webhooks).")
 
 # If PG_DSN is not set, derive a psycopg2 DSN from DATABASE_URL.
 # This keeps one canonical source of truth while preserving existing sync code.

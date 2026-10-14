@@ -36,7 +36,7 @@ def _redis() -> redis.Redis:
             health_check_interval=30,
             socket_timeout=10,
             retry_on_timeout=True,
-            ssl_cert_reqs=None
+            **({"ssl_cert_reqs": None} if cfg.REDIS_URL.startswith("rediss://") else {}),
         )
     return _r
 
@@ -63,6 +63,8 @@ def enqueue(queue: str, job_name: str, data: Dict[str, Any], priority: str = "NO
         logger.debug("Queued %s/%s priority=%s score=%.0f", queue, job_name, priority, score)
     except Exception as exc:
         logger.error("Queue enqueue failed: %s", exc)
+        if cfg.DEMO_MODE:
+            return   # Redis is optional in demo mode; the queues only feed downstream workers
         raise
 
 

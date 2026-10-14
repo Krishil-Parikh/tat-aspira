@@ -41,7 +41,9 @@ async def get_current_user(request: Request) -> UserSession:
     Verifies signature against SECRET_KEY.
     """
     # Skip authentication for demo/testing purposes
-    if DEMO_MODE or request.headers.get("X-Demo-Mode") == "true":
+    # The X-Demo-Mode header is honoured only when the server itself runs in DEMO_MODE;
+    # on its own it used to let any client skip login, including in production.
+    if DEMO_MODE:
         # In demo mode, respect the cookies set by the frontend UI
         email = request.cookies.get("aspira_email", "demo@aspira.com")
         role = normalize_role(request.cookies.get("aspira_role", "admin"))

@@ -5,13 +5,14 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 
 from app.workers.celery_app import process_webhook_task
 from app.core.auth import require_role, UserSession
+from config.settings import cfg
 
 logger = logging.getLogger("routers.actions")
 
@@ -49,22 +50,49 @@ async def _insert_internal_webhook_event(conn, *, webhook_id: int, webhook_type:
         raise HTTPException(500, "Webhook event insert failed")
     return row["id"], row["duplicate"]
 
-async def _internal_receipt_payload(conn, sample, ext_bill_id: int, lab_id: int, now: datetime) -> dict:
+def _receipt_time(requested: Optional[datetime], now: datetime) -> datetime:
+    """Receipts happen now; demo mode may back-date them to stage a timeline."""
+    if requested is None:
+        return now
+    if not cfg.DEMO_MODE:
+        raise HTTPException(400, "received_time can only be set in DEMO_MODE")
+    return requested.astimezone(timezone.utc).replace(tzinfo=None) if requested.tzinfo else requested
+
+
+async def _internal_receipt_payload(conn, sample, ext_bill_id: int, lab_id: int, received: datetime,
+                                    test_codes: Optional[List[str]] = None) -> dict:
     """SAMPLE_RECEIVED payload for a UI receipt. labId carries the CrelioHealth (external)
     lab id like a real webhook; internalLabId lets the handler use the chosen lab even when
-    the lab has no external id mapped."""
+    the lab has no external id mapped. test_codes, when given, become the receipt's
+    CentreReportId list so only those tests are routed to this lab."""
     lab = await conn.fetchrow("SELECT id, external_lab_id FROM tat_lab WHERE id=$1 AND is_active=1", lab_id)
     if not lab:
         raise HTTPException(400, f"Lab {lab_id} not found or inactive")
-    return {
+    payload = {
         "webhook_type": "SAMPLE_RECEIVED",
         "bill_id": ext_bill_id,
         "sampleId": sample["external_sample_id"],
         "accessionNo": sample["accession_no"],
         "labId": lab["external_lab_id"] or lab_id,
         "internalLabId": lab_id,
-        "receivedTime": now.isoformat(),
+        "receivedTime": received.isoformat(),
     }
+    if test_codes:
+        codes = {c.strip() for c in test_codes}
+        rows = await conn.fetch("""
+            SELECT test_code, external_report_id FROM tat_test_instance
+            WHERE sample_id=$1 AND is_current_cycle=1 AND test_code = ANY($2::text[])
+        """, sample["id"], list(codes))
+        missing = sorted(codes - {r["test_code"] for r in rows})
+        if missing:
+            raise HTTPException(400, "Tests not on this sample: " + ", ".join(missing))
+        payload["CentreReportId"] = [r["external_report_id"] for r in rows]
+    return payload
+
+
+def _receipt_scope(sample, sample_id: int, lab_id: int, received: datetime, test_codes: Optional[List[str]]) -> str:
+    codes = ",".join(sorted(test_codes)) if test_codes else ""
+    return f"{sample['accession_no'] or sample_id}:{lab_id}:{received.isoformat()}:{codes}"[:160]
 
 # ── Logistics ─────────────────────────────────────────────────────────────────
 
@@ -106,6 +134,8 @@ async def confirm_pickup(req: PickupRequest, user: UserSession = Depends(require
 class DeliveryRequest(BaseModel):
     sample_id: int
     lab_id: int
+    test_codes: Optional[List[str]] = None       # tests in this delivery; default: whole sample
+    received_time: Optional[datetime] = None     # DEMO_MODE only: back-date the receipt
 
 @actions_router.post("/logistics/confirm-delivery")
 async def confirm_delivery(req: DeliveryRequest, user: UserSession = Depends(require_role(['logistics', 'admin']))):
@@ -122,7 +152,8 @@ async def confirm_delivery(req: DeliveryRequest, user: UserSession = Depends(req
             raise HTTPException(404, "Sample not found")
 
         ext_bill_id = sample["external_bill_id"] or sample["internal_bill_id"]
-        payload = await _internal_receipt_payload(conn, sample, ext_bill_id, req.lab_id, now)
+        received = _receipt_time(req.received_time, now)
+        payload = await _internal_receipt_payload(conn, sample, ext_bill_id, req.lab_id, received, req.test_codes)
         event_id, duplicate = await _insert_internal_webhook_event(
             conn,
             webhook_id=req.sample_id,
@@ -130,7 +161,7 @@ async def confirm_delivery(req: DeliveryRequest, user: UserSession = Depends(req
             bill_id=ext_bill_id,
             lab_id=req.lab_id,
             payload=payload,
-            dedupe_scope=f"{sample['accession_no'] or req.sample_id}:{req.lab_id}",
+            dedupe_scope=_receipt_scope(sample, req.sample_id, req.lab_id, received, req.test_codes),
         )
         if not duplicate:
             process_webhook_task.delay(event_id)
@@ -165,6 +196,8 @@ async def get_lab_work_queue(lab_id: int, user: UserSession = Depends(require_ro
 class LabReceiptRequest(BaseModel):
     sample_id: int
     lab_id: int
+    test_codes: Optional[List[str]] = None       # tests received at this lab; default: whole sample
+    received_time: Optional[datetime] = None     # DEMO_MODE only: back-date the receipt
 
 @actions_router.post("/lab/confirm-receipt")
 async def lab_confirm_receipt(req: LabReceiptRequest, user: UserSession = Depends(require_role(['lab', 'admin']))):
@@ -181,7 +214,8 @@ async def lab_confirm_receipt(req: LabReceiptRequest, user: UserSession = Depend
             raise HTTPException(404, "Sample not found")
 
         ext_bill_id = sample["external_bill_id"] or sample["internal_bill_id"]
-        payload = await _internal_receipt_payload(conn, sample, ext_bill_id, req.lab_id, now)
+        received = _receipt_time(req.received_time, now)
+        payload = await _internal_receipt_payload(conn, sample, ext_bill_id, req.lab_id, received, req.test_codes)
         event_id, duplicate = await _insert_internal_webhook_event(
             conn,
             webhook_id=req.sample_id,
@@ -189,11 +223,7 @@ async def lab_confirm_receipt(req: LabReceiptRequest, user: UserSession = Depend
             bill_id=ext_bill_id,
             lab_id=req.lab_id,
             payload=payload,
-            dedupe_scope=f"{sample['accession_no'] or req.sample_id}:{req.lab_id}",
-        )
-        await conn.execute(
-            "UPDATE tat_sample SET arrived_at_lab=$1, status='arrived', updated_at=$1 WHERE id=$2",
-            now, req.sample_id
+            dedupe_scope=_receipt_scope(sample, req.sample_id, req.lab_id, received, req.test_codes),
         )
         if not duplicate:
             process_webhook_task.delay(event_id)
@@ -222,18 +252,25 @@ async def submit_test_result(req: SubmitResultRequest, user: UserSession = Depen
     from app.pg_database import _pool
     now = _now()
     async with _pool.acquire() as conn:
-        sample = await conn.fetchrow("SELECT bill_id FROM tat_sample WHERE id=$1", req.sample_id)
-        if not sample:
-            raise HTTPException(404, "Sample not found")
-        test = await conn.fetchrow("SELECT test_code, processing_lab_id FROM tat_test_instance WHERE id=$1", req.test_instance_id)
+        test = await conn.fetchrow("""
+            SELECT ti.test_code, ti.processing_lab_id, ti.external_report_id, ti.external_test_id,
+                   COALESCE(b.external_bill_id, b.id) AS ext_bill_id
+            FROM tat_test_instance ti JOIN tat_bill b ON b.id = ti.bill_id
+            WHERE ti.id=$1 AND ti.sample_id=$2
+        """, req.test_instance_id, req.sample_id)
         if not test:
-            raise HTTPException(404, "Test instance not found")
-        payload = {"webhook_type": "REPORT_SUBMIT", "bill_id": sample["bill_id"], "labId": test["processing_lab_id"], "testID": req.test_instance_id, "testCode": test["test_code"], "result": req.result, "reportDate": now.isoformat()}
+            raise HTTPException(404, "Test instance not found on this sample")
+        # CrelioHealth ids, as a real Report Submit carries them, so the handler finds the test
+        # (it used to send the internal bill / test ids, which never matched).
+        payload = {"webhook_type": "REPORT_SUBMIT", "billId": test["ext_bill_id"],
+                   "labReportId": test["external_report_id"], "testID": test["external_test_id"],
+                   "labId": test["processing_lab_id"], "testCode": test["test_code"],
+                   "result": req.result, "reportDate": now.isoformat()}
         event_id, duplicate = await _insert_internal_webhook_event(
             conn,
             webhook_id=req.test_instance_id,
             webhook_type="REPORT_SUBMIT",
-            bill_id=sample["bill_id"],
+            bill_id=test["ext_bill_id"],
             lab_id=test["processing_lab_id"],
             payload=payload,
         )

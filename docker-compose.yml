@@ -82,8 +82,9 @@ services:
       context: .
       dockerfile: deploy/Dockerfile.frontend
       args:
-        # The browser calls the backend via the host's localhost:8000
-        NEXT_PUBLIC_API_URL: http://localhost:8000
+        # The browser calls the backend directly, so this is the server's public address.
+        # Override with PUBLIC_API_URL in .env (e.g. http://localhost:8000 for local runs).
+        NEXT_PUBLIC_API_URL: ${PUBLIC_API_URL:-http://16.16.199.24:8000}
     container_name: aspira_frontend
     restart: unless-stopped
     depends_on:

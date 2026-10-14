@@ -13,6 +13,12 @@ celery_app.conf.update(
     redis_backend_use_ssl={"ssl_cert_reqs": "none"} if cfg.REDIS_URL.startswith("rediss://") else False,
     broker_pool_limit=1,  # Upstash has connection limits
 )
+if cfg.DEMO_MODE:
+    # Demo mode: .delay() runs the task inline in the API process, so the webhook is
+    # processed before the HTTP response returns and no worker or broker is needed.
+    celery_app.conf.task_always_eager = True
+    celery_app.conf.task_eager_propagates = False
+
 celery_app.conf.beat_schedule = {
     "sweep-delayed":        {"task": "sweep.delayed",        "schedule": 300.0},
     "refresh-proj":         {"task": "projection.refresh",   "schedule": 600.0},

@@ -105,6 +105,12 @@ def _sha256(raw: bytes) -> str:
 
 
 async def _verify_webhook_auth(raw_body: bytes, request: Request) -> None:
+    signed = request.headers.get(cfg.WEBHOOK_SIGNATURE_HEADER) or request.headers.get("X-Hub-Signature-256")
+    if cfg.DEMO_MODE and not signed:
+        # Demo mode: hand-typed requests (Swagger / Postman / curl) need no signature.
+        # A request that does carry a signature is still verified below.
+        logger.warning("DEMO_MODE: accepting unsigned webhook")
+        return
     if not cfg.WEBHOOK_SHARED_SECRET:
         raise HTTPException(status_code=503, detail="Webhook authentication not configured")
 
@@ -270,11 +276,33 @@ _SAMPLE_SCOPED_TYPES = {
 }
 
 
+_REPORT_SCOPED_TYPES = {
+    WebhookType.REPORT_SAVE, WebhookType.REPORT_SUBMIT, WebhookType.REPORT_SIGNED,
+    WebhookType.REPORT_PDF, WebhookType.TEST_DISMISSED,
+}
+_CONTENT_SCOPED_TYPES = {WebhookType.BILL_UPDATE, WebhookType.ADD_TEST_TO_BILL}
+
+
 def _dedupe_scope(webhook_type: WebhookType, body: Dict[str, Any]) -> str:
-    """Sample events carry one billId for every tube on the bill, and CrelioHealth sends
-    Sample Received once per receiving lab. Scope them by accession (+ lab and accession
-    time for receipts) so a second tube, a second lab, or a re-receipt after a redraw is
-    not dropped as a duplicate; a retried delivery repeats all three and still dedupes."""
+    """What makes an event distinct within its bill, so that only a retried delivery of the
+    same event is treated as a duplicate (CrelioHealth sends the same billId and webhookId
+    for every event of a type on a bill):
+      - report events: one per report, keyed by report id + report/approval date
+        (an amended report has a new date and is processed again);
+      - bill updates / added tests: keyed by content, since a bill can change many times;
+      - sample events: keyed by accession (one per tube); receipts also by receiving lab
+        and accession time, so a second lab or a re-receipt after a redraw gets through;
+      - bill generate / cancel: once per bill."""
+    if webhook_type in _REPORT_SCOPED_TYPES:
+        rpt = (body.get("labReportId") or body.get("CentreReportId") or body.get("Report Id")
+               or body.get("reportID") or body.get("testID") or "")
+        if isinstance(rpt, list):
+            rpt = ",".join(str(r) for r in rpt)
+        when = (body.get("reportDate") or body.get("Report Date") or body.get("approvalDate")
+                or body.get("Approval Date") or "")
+        return f"{str(rpt)[:100]}:{str(when)[:32]}"
+    if webhook_type in _CONTENT_SCOPED_TYPES:
+        return _sha256(orjson.dumps(body, option=orjson.OPT_SORT_KEYS))[:32]
     if webhook_type not in _SAMPLE_SCOPED_TYPES:
         return ""
     acc = body.get("accessionNo") or body.get("sampleId") or body.get("sampleID") or body.get("identifier") or ""

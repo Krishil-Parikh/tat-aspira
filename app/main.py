@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse
 from app import pg_database as pgdb
 from app.core.hot_cache import _redis as _hot_redis
 from app.routers.webhook import router as webhook_router
+from app.routers.demo import router as demo_router
 from app.routers.api import (
     samples_router,
     bills_router,
@@ -136,6 +137,7 @@ app.include_router(admin_router)      # Bug 2 Fix: GET /api/admin/*
 app.include_router(actions_router)
 app.include_router(dashboard_router)
 app.include_router(tat_config_router)
+app.include_router(demo_router)
 
 
 # ── Health & Root ─────────────────────────────────────────────────────────────

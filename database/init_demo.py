@@ -68,6 +68,13 @@ def _is_neon_database():
 # REALISTIC LAB NETWORK CONFIGURATION
 # ====================================================================
 
+# CrelioHealth-style lab ids for the demo network, so Sample Received payloads can name
+# the receiving lab by its labId exactly as CrelioHealth does.
+DEMO_EXTERNAL_LAB_IDS = {
+    "GHK": 1001, "NM": 1002, "SHOBHA": 1003, "KHARGHAR": 1004, "CHEMBUR": 1005,
+    "HOC": 1006, "TRUECARE": 1007, "SSO": 1008, "OS": 1009,
+}
+
 LABS = [
     {
         "lab_name": "GHK - Main Hybrid Lab",
@@ -364,12 +371,12 @@ async def run_demo_init():
         for lab in LABS:
             lab_id = await conn.fetchval("""
                 INSERT INTO tat_lab (lab_name, lab_code, lab_type, max_concurrent_samples, processing_mode, 
-                                     default_processing_mins, is_fallback, is_active, timezone)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                                     default_processing_mins, is_fallback, is_active, timezone, external_lab_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                 RETURNING id
             """, lab["lab_name"], lab["lab_code"], lab["lab_type"], lab["max_concurrent_samples"],
                 lab["processing_mode"], lab["default_processing_mins"], lab["is_fallback"], lab["is_active"],
-                lab["timezone"])
+                lab["timezone"], DEMO_EXTERNAL_LAB_IDS.get(lab["lab_code"]))
             lab_code_to_id[lab["lab_code"]] = lab_id
             logger.info(f"  ✓ Created lab: {lab['lab_code']} - {lab['lab_name']} (id={lab_id})")
         
@@ -505,6 +512,10 @@ async def run_demo_init():
         for user in USERS:
             if user["role"] == "lab":
                 logger.info(f"  {user['email']} - {user['full_name']} (lab={user.get('lab_code', 'N/A')})")
+        logger.info("")
+        logger.info("=== Lab ids (internal id / CrelioHealth labId) ===")
+        for code, internal_id in lab_code_to_id.items():
+            logger.info(f"  {code:<9} id={internal_id:<3} labId={DEMO_EXTERNAL_LAB_IDS.get(code)}")
         logger.info("")
         logger.info("=== Next Steps ===")
         logger.info("1. Start backend: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload")
