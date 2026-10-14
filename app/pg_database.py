@@ -97,15 +97,16 @@ async def insert_webhook_event(data: Dict[str, Any]) -> int:
     WITH ins AS (
         INSERT INTO tat_webhook_event
           (webhook_id, webhook_type, bill_id, internal_bill_id, lab_id,
-           payload, payload_hash, source_ip, auth_token_hash, status)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'received')
-        ON CONFLICT (bill_id, webhook_type, webhook_id) DO NOTHING
+           payload, payload_hash, source_ip, auth_token_hash, status, dedupe_scope)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'received',$10)
+        ON CONFLICT (bill_id, webhook_type, webhook_id, dedupe_scope) DO NOTHING
         RETURNING id
     )
     SELECT id FROM ins
     UNION ALL
     SELECT id FROM tat_webhook_event
     WHERE bill_id = $3 AND webhook_type = $2 AND (webhook_id IS NOT DISTINCT FROM $1)
+      AND dedupe_scope = $10
     LIMIT 1
     """
 
@@ -116,6 +117,7 @@ async def insert_webhook_event(data: Dict[str, Any]) -> int:
         lab_id_val,
         json.dumps(data["payload"]),
         data.get("payload_hash"), data.get("source_ip"), data.get("auth_token_hash"),
+        data.get("dedupe_scope") or "",
     )
     
     if not row:
@@ -162,10 +164,11 @@ async def mark_event_failed(event_id: int, error: str) -> None:
     )
 
 
-async def check_duplicate_event(external_key: Any, webhook_type: str, webhook_id: Optional[int]) -> bool:
+async def check_duplicate_event(external_key: Any, webhook_type: str, webhook_id: Optional[int],
+                                dedupe_scope: str = "") -> bool:
     """
-    Returns True only when an event with the SAME (bill_id, webhook_type, webhook_id)
-    already exists.  Using IS NOT DISTINCT FROM handles the NULL == NULL case.
+    Returns True only when an event with the SAME (bill_id, webhook_type, webhook_id,
+    dedupe_scope) already exists.  Using IS NOT DISTINCT FROM handles the NULL == NULL case.
 
     FIX BUG-001: The original query ignored webhook_id, causing legitimate re-collection
     events (same bill, same type, different webhookId) to be dropped as duplicates.
@@ -183,8 +186,9 @@ async def check_duplicate_event(external_key: Any, webhook_type: str, webhook_id
         """SELECT id FROM tat_webhook_event
            WHERE bill_id=$1
              AND webhook_type=$2
-             AND (webhook_id IS NOT DISTINCT FROM $3)""",
-        bid, webhook_type, wid,
+             AND (webhook_id IS NOT DISTINCT FROM $3)
+             AND dedupe_scope=$4""",
+        bid, webhook_type, wid, dedupe_scope or "",
     )
     return row is not None
 
@@ -508,7 +512,7 @@ async def upsert_test_instance(data: Dict[str, Any], conn=None) -> int:
        processing_time_mins, processing_time_is_default,
        sample_date, predicted_report_date, status)
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
-    ON CONFLICT (external_report_id) DO UPDATE
+    ON CONFLICT (external_report_id) WHERE is_current_cycle = 1 DO UPDATE
       SET status = EXCLUDED.status, updated_at = CURRENT_TIMESTAMP
     RETURNING id
     """
@@ -706,7 +710,8 @@ async def get_tracked_test_detail(test_id: int) -> Optional[Dict[str, Any]]:
 
 async def get_test_instance_by_external_report(external_report_id: int) -> Optional[Dict]:
     row = await _pool.fetchrow(
-        "SELECT * FROM tat_test_instance WHERE external_report_id=$1", external_report_id
+        "SELECT * FROM tat_test_instance WHERE external_report_id=$1 "
+        "ORDER BY is_current_cycle DESC, id DESC LIMIT 1", external_report_id
     )
     return _row(row)
 

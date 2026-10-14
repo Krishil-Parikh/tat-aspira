@@ -163,7 +163,8 @@ def _find_test_for_report(cur, payload: Dict[str, Any], extra_cols: str = "") ->
     cols = "ti.id, ti.sample_id, ti.bill_id" + (", " + extra_cols if extra_cols else "")
     ext_report_id = _int_or_none(_report_id(payload))
     if ext_report_id is not None:
-        cur.execute(f"SELECT {cols} FROM tat_test_instance ti WHERE ti.external_report_id=%s LIMIT 1", (ext_report_id,))
+        cur.execute(f"SELECT {cols} FROM tat_test_instance ti WHERE ti.external_report_id=%s "
+                    "ORDER BY ti.is_current_cycle DESC, ti.id DESC LIMIT 1", (ext_report_id,))
         row = cur.fetchone()
         if row:
             return row
@@ -180,7 +181,8 @@ def _find_test_for_report(cur, payload: Dict[str, Any], extra_cols: str = "") ->
             if ext_report_id is not None:
                 cur.execute("""
                     UPDATE tat_test_instance SET external_report_id=%s, updated_at=CURRENT_TIMESTAMP
-                    WHERE id=%s AND NOT EXISTS (SELECT 1 FROM tat_test_instance WHERE external_report_id=%s)
+                    WHERE id=%s AND NOT EXISTS (SELECT 1 FROM tat_test_instance
+                                                 WHERE external_report_id=%s AND is_current_cycle=1)
                 """, (ext_report_id, row["id"], ext_report_id))
             return row
     test_code = payload.get("testCode")
@@ -218,6 +220,18 @@ def _bill_generate_samples(payload: Dict[str, Any]) -> list[Dict[str, Any]]:
     if not isinstance(sample, dict):
         sample = {"sampleId": sample}
     reports = [_flatten_report(r) for r in (payload.get("labReportDetails") or payload.get("testDetails") or [])]
+    # billInfoDetails[].TestDetails.outsourceflag is the test-master outsource flag; use it
+    # when the per-report outsourcedReportFlag is absent.
+    outsource_by_test = {}
+    for info in payload.get("billInfoDetails") or []:
+        td = info.get("TestDetails") if isinstance(info, dict) else None
+        if isinstance(td, dict) and td.get("outsourceflag") is not None:
+            outsource_by_test[_int_or_none(td.get("testId") or info.get("testId"))] = bool(td["outsourceflag"])
+    for rpt in reports:
+        if rpt.get("isOutsourced") is None:
+            flag = outsource_by_test.get(_int_or_none(rpt.get("testID")))
+            if flag is not None:
+                rpt["isOutsourced"] = flag
     base = {
         "sampleId": sample.get("id") or sample.get("sampleId") or payload.get("sampleId") or _external_bill_id(payload),
         "accessionNo": sample.get("accessionNo") or payload.get("accessionNo"),
@@ -656,7 +670,7 @@ def _handle_bill_generate(cur, event: dict, payload: dict) -> None:
                    processing_time_is_default, sample_date, status,
                    processing_lab_id, routing_reason)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending',%s,%s)
-                ON CONFLICT (external_report_id) DO UPDATE
+                ON CONFLICT (external_report_id) WHERE is_current_cycle = 1 DO UPDATE
                   SET sample_id = EXCLUDED.sample_id,
                       test_code = COALESCE(EXCLUDED.test_code, tat_test_instance.test_code),
                       department_id = COALESCE(EXCLUDED.department_id, tat_test_instance.department_id),
@@ -923,6 +937,12 @@ def _route_tests(cur, sample_id: int, bill_id: int, tests: list,
             "webhook_event_id": event_id,
             "notes": f"Test {t['test_code']} → lab {lab_id} ({reason})" if lab_id else f"Test {t['test_code']} unassigned: {reason}",
         })
+        if not lab_id:
+            cur.execute("""
+                UPDATE tat_processing_assignment
+                SET assignment_status='unassigned', updated_at=CURRENT_TIMESTAMP
+                WHERE test_instance_id=%s AND assignment_status='assigned'
+            """, (t["id"],))
         if lab_id:
             lab_groups.setdefault(lab_id, []).append(t)
             # This fixes the multi-lab issue where different tests arrive at different labs
@@ -953,37 +973,83 @@ def _route_tests(cur, sample_id: int, bill_id: int, tests: list,
                     predicted_eta=None # will be updated by batch logic if needed
                 )
     return lab_groups, any_unassigned
+def _refresh_sample_eta(cur, sample_id: int) -> None:
+    """Sample-level tat_eta = the latest-finishing lab across the sample's live tests.
+    One row per sample, so it is derived from the per-test tat_eta_record rows rather than
+    written per lab (a per-lab write kept only the last lab scheduled)."""
+    cur.execute("""
+        WITH live AS (
+            SELECT r.*
+            FROM tat_eta_record r
+            JOIN tat_test_instance ti ON ti.id = r.test_instance_id
+            WHERE r.sample_id = %s AND ti.is_current_cycle = 1
+              AND ti.status NOT IN ('cancelled','invalidated')
+        ),
+        latest AS (SELECT * FROM live ORDER BY estimated_end_time DESC LIMIT 1),
+        agg AS (
+            SELECT MAX(is_tat_breached) AS is_breached, MAX(breach_by_mins) AS breach_by,
+                   MAX(predefined_tat_mins) AS pred_mins, MIN(estimated_start_time) AS first_start
+            FROM live
+        )
+        INSERT INTO tat_eta
+          (sample_id, queue_entry_id, bill_id, collection_time, arrival_time_at_lab,
+           estimated_start_time, estimated_end_time, queue_wait_mins, lab_processing_mins,
+           lab_eta_mins, total_eta_mins, predefined_tat_mins, is_tat_breached, breach_by_mins, version)
+        SELECT l.sample_id, l.queue_entry_id, l.bill_id, l.collection_time, l.arrival_time_at_lab,
+               a.first_start, l.estimated_end_time, l.queue_wait_mins, l.lab_processing_mins,
+               l.lab_processing_mins, l.total_eta_mins, a.pred_mins, a.is_breached, a.breach_by, 1
+        FROM latest l CROSS JOIN agg a
+        ON CONFLICT (sample_id) DO UPDATE
+          SET queue_entry_id       = EXCLUDED.queue_entry_id,
+              arrival_time_at_lab  = EXCLUDED.arrival_time_at_lab,
+              estimated_start_time = EXCLUDED.estimated_start_time,
+              estimated_end_time   = EXCLUDED.estimated_end_time,
+              queue_wait_mins      = EXCLUDED.queue_wait_mins,
+              lab_processing_mins  = EXCLUDED.lab_processing_mins,
+              lab_eta_mins         = EXCLUDED.lab_eta_mins,
+              total_eta_mins       = EXCLUDED.total_eta_mins,
+              predefined_tat_mins  = EXCLUDED.predefined_tat_mins,
+              is_tat_breached      = EXCLUDED.is_tat_breached,
+              breach_by_mins       = EXCLUDED.breach_by_mins,
+              version              = tat_eta.version + 1,
+              updated_at           = CURRENT_TIMESTAMP
+    """, (sample_id,))
 def _schedule_lab_groups(cur, sample_id: int, bill_id: int, lab_groups: Dict[int, list],
                          received_time: datetime, collected_at: datetime, priority: int,
                          tat_category: str, event_id: int, reuse_existing_slot: bool = False) -> None:
     """Per lab: reserve a batch slot, upsert the queue entry, write ETAs, flag TAT breaches.
     Shared by SAMPLE_RECEIVED and ADD_TEST_TO_BILL (reuse_existing_slot=True)."""
     for lab_id, lab_tests in lab_groups.items():
-        existing_queue = None
-        if reuse_existing_slot:
-            # Tests added to a sample already queued at this lab join its batch slot;
-            # the queue/ETA end time is recalculated over all of the sample's tests there.
+        # A sample already queued at this lab (tests added later, or a second receipt that
+        # routes more tests here) is scheduled as one unit: processing time and ETA are
+        # recalculated over every test currently assigned to this lab.
+        cur.execute("""
+            SELECT id, estimated_start_time, arrival_time FROM tat_lab_queue
+            WHERE sample_id=%s AND lab_id=%s AND status NOT IN ('completed','cancelled','skipped')
+        """, (sample_id, lab_id))
+        existing_queue = cur.fetchone()
+        if existing_queue:
             cur.execute("""
-                SELECT id, estimated_start_time FROM tat_lab_queue
-                WHERE sample_id=%s AND lab_id=%s AND status NOT IN ('completed','cancelled','skipped')
-            """, (sample_id, lab_id))
-            existing_queue = cur.fetchone()
-            if existing_queue:
-                cur.execute("""
-                    SELECT id, department_id, test_code, processing_time_mins
-                    FROM tat_test_instance
-                    WHERE sample_id=%s AND processing_lab_id=%s AND is_current_cycle=1
-                      AND status NOT IN ('cancelled','invalidated')
-                """, (sample_id, lab_id))
-                lab_tests = cur.fetchall()
+                SELECT ti.id, ti.department_id, ti.test_code, ti.processing_time_mins
+                FROM tat_test_instance ti
+                JOIN tat_processing_assignment pa
+                  ON pa.test_instance_id = ti.id AND pa.assignment_status = 'assigned'
+                 AND pa.destination_lab_id = %s
+                WHERE ti.sample_id=%s AND ti.is_current_cycle=1
+                  AND ti.status NOT IN ('cancelled','invalidated','completed')
+            """, (lab_id, sample_id))
+            lab_tests = cur.fetchall() or lab_tests
         test_codes = [t["test_code"] for t in lab_tests if t["test_code"]]
         t_sum, t_max, active_mins = resolve_processing_times(test_codes, lab_id, cur)
-        if existing_queue:
+        lab_arrival = received_time
+        if existing_queue and reuse_existing_slot:
+            # Added tests join the slot the sample already holds at this lab.
             start = existing_queue["estimated_start_time"]
+            lab_arrival = existing_queue["arrival_time"]
             slot = {"batch_time": start, "batch_date": start.date(),
                     "batch_schedule_id": None, "is_fallback": False}
         else:
-            # the slot via a capacity-guarded CTE (no separate INSERT needed below).
+            # Slot from this lab's own arrival time, reserved via a capacity-guarded CTE.
             slot = assign_batch_slot(lab_id, received_time, cur, active_mins, sample_id)
         batch_time: datetime = _naive_utc(slot["batch_time"])
         batch_date            = slot["batch_date"]
@@ -998,13 +1064,19 @@ def _schedule_lab_groups(cur, sample_id: int, bill_id: int, lab_groups: Dict[int
             ON CONFLICT (sample_id, lab_id) DO UPDATE
               SET estimated_start_time=EXCLUDED.estimated_start_time,
                   estimated_end_time=EXCLUDED.estimated_end_time,
+                  arrival_time=EXCLUDED.arrival_time,
+                  processing_time_sum_mins=EXCLUDED.processing_time_sum_mins,
+                  processing_time_max_mins=EXCLUDED.processing_time_max_mins,
+                  processing_time_mins=EXCLUDED.processing_time_mins,
                   priority=EXCLUDED.priority,
+                  status=CASE WHEN tat_lab_queue.status IN ('cancelled','skipped')
+                              THEN 'scheduled' ELSE tat_lab_queue.status END,
                   updated_at=CURRENT_TIMESTAMP
             RETURNING id
         """, (
             sample_id, lab_id, bill_id, priority,
             t_sum, t_max, active_mins,
-            received_time, batch_time,
+            lab_arrival, batch_time,
             batch_time + timedelta(minutes=active_mins),
         ))
         queue_id = cur.fetchone()["id"]
@@ -1015,41 +1087,8 @@ def _schedule_lab_groups(cur, sample_id: int, bill_id: int, lab_groups: Dict[int
         is_breached, pred_mins, breach_by = detect_tat_breach(
             collected_at, estimated_end, pred_tat_hrs
         )
-        queue_wait = int((batch_time - received_time).total_seconds() / 60)
+        queue_wait = int((batch_time - lab_arrival).total_seconds() / 60)
         total_eta  = int((estimated_end - collected_at).total_seconds() / 60)
-        # Sample-level ETA is deprecated in favor of per-test-instance ETA tracking
-        # for multi-lab processing accuracy. Keeping tat_eta for backward compatibility
-        # but not populating it in new code.
-        #
-        # Insert or update sample-level ETA (tat_eta) - DEPRECATED
-        # This is kept for backward compatibility with existing queries
-        cur.execute("""
-            INSERT INTO tat_eta
-              (sample_id, queue_entry_id, bill_id,
-               collection_time, arrival_time_at_lab,
-               estimated_start_time, estimated_end_time,
-               queue_wait_mins, lab_processing_mins, lab_eta_mins, total_eta_mins,
-               predefined_tat_mins, is_tat_breached, breach_by_mins, version)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
-            ON CONFLICT (sample_id) DO UPDATE
-              SET queue_entry_id        = EXCLUDED.queue_entry_id,
-                  estimated_end_time    = EXCLUDED.estimated_end_time,
-                  total_eta_mins        = EXCLUDED.total_eta_mins,
-                  is_tat_breached       = EXCLUDED.is_tat_breached,
-                  breach_by_mins        = EXCLUDED.breach_by_mins,
-                  version               = tat_eta.version + 1,
-                  updated_at            = CURRENT_TIMESTAMP
-        """, (
-            sample_id, queue_id, bill_id,
-            collected_at, received_time,
-            batch_time, estimated_end,
-            queue_wait, active_mins, active_mins, total_eta,
-            pred_mins, 1 if is_breached else 0, breach_by,
-        ))
-        # Retrieve newly-upserted ETA id for audit/history and per-test records
-        cur.execute("SELECT id FROM tat_eta WHERE sample_id=%s", (sample_id,))
-        eta_row = cur.fetchone()
-        eta_id = eta_row["id"] if eta_row else None
         # ✅ CREATE ETA_RECORDS for per-test tracking (one per test_instance)
         for lab_test in lab_tests:
             test_instance_id = lab_test["id"]
@@ -1069,14 +1108,21 @@ def _schedule_lab_groups(cur, sample_id: int, bill_id: int, lab_groups: Dict[int
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
                 ON CONFLICT (test_instance_id) DO UPDATE
                   SET queue_entry_id = EXCLUDED.queue_entry_id,
+                      lab_id = EXCLUDED.lab_id,
+                      arrival_time_at_lab = EXCLUDED.arrival_time_at_lab,
+                      estimated_start_time = EXCLUDED.estimated_start_time,
                       estimated_end_time = EXCLUDED.estimated_end_time,
+                      queue_wait_mins = EXCLUDED.queue_wait_mins,
+                      lab_processing_mins = EXCLUDED.lab_processing_mins,
+                      total_eta_mins = EXCLUDED.total_eta_mins,
+                      predefined_tat_mins = EXCLUDED.predefined_tat_mins,
                       is_tat_breached = EXCLUDED.is_tat_breached,
                       breach_by_mins = EXCLUDED.breach_by_mins,
                       version = tat_eta_record.version + 1,
                       updated_at = CURRENT_TIMESTAMP
             """, (
                 test_instance_id, queue_id, sample_id, bill_id, lab_id,
-                collected_at, received_time,
+                collected_at, lab_arrival,
                 batch_time, estimated_end,
                 queue_wait, active_mins, total_eta,
                 test_pred_mins, 1 if test_is_breached else 0, test_breach_by
@@ -1107,6 +1153,7 @@ def _schedule_lab_groups(cur, sample_id: int, bill_id: int, lab_groups: Dict[int
                 {"total_eta_mins": total_eta, "predefined_tat_mins": pred_mins,
                  "breach_by_mins": breach_by, "estimated_end_time": estimated_end},
             )
+    _refresh_sample_eta(cur, sample_id)
     # This ensures samples near SLA breach are prioritized
     for lab_id in lab_groups.keys():
         try:
@@ -1114,6 +1161,45 @@ def _schedule_lab_groups(cur, sample_id: int, bill_id: int, lab_groups: Dict[int
             recalculate_lab_queue_priorities(lab_id, cur)
         except Exception as e:
             logger.warning("[QUEUE_PRIORITIZER] Failed to recalculate priorities for lab_id=%d: %s", lab_id, e)
+def _receipt_lab_id(cur, payload: Dict[str, Any]) -> Optional[int]:
+    """Internal tat_lab.id of the lab that received the sample. UI receipts send
+    internalLabId; CrelioHealth sends its own labId, matched on tat_lab.external_lab_id."""
+    internal = _int_or_none(payload.get("internalLabId"))
+    if internal:
+        cur.execute("SELECT id FROM tat_lab WHERE id=%s", (internal,))
+        if cur.fetchone():
+            return internal
+    raw = payload.get("labId")
+    ext = _int_or_none(raw.get("labId") if isinstance(raw, dict) else raw)
+    if ext:
+        cur.execute("SELECT id FROM tat_lab WHERE external_lab_id=%s LIMIT 1", (ext,))
+        row = cur.fetchone()
+        if row:
+            return row["id"]
+    return None
+def _received_test_ids(tests: list, payload: Dict[str, Any]) -> Optional[set]:
+    """Test instances named by a Sample Received payload (CentreReportId / labReportId /
+    testID lists). None when the payload names no tests, or none of them match."""
+    def _ids(*keys):
+        out = set()
+        for key in keys:
+            val = payload.get(key)
+            for item in (val if isinstance(val, list) else [val]):
+                i = _int_or_none(item)
+                if i is not None:
+                    out.add(i)
+        return out
+    report_ids = _ids("CentreReportId", "labReportId")
+    test_ids = _ids("testID")
+    if not report_ids and not test_ids:
+        return None
+    matched = {t["id"] for t in tests
+               if t["external_report_id"] in report_ids or t["external_test_id"] in test_ids}
+    if not matched:
+        logger.warning("[SAMPLE_RECEIVED] none of the received tests matched (reports=%s tests=%s); "
+                       "treating receipt as covering the whole sample", report_ids, test_ids)
+        return None
+    return matched
 def _handle_sample_received(cur, event: Dict, payload: Dict) -> None:
     event_id      = event["id"]
     acc_no        = _sample_accession(payload)
@@ -1138,15 +1224,19 @@ def _handle_sample_received(cur, event: Dict, payload: Dict) -> None:
     is_valid, error_msg = validate_sample_transition(current_status, "arrived")
     if not is_valid:
         logger.warning("[STATE_MACHINE] Invalid sample transition in SAMPLE_RECEIVED: %s", error_msg)
+    webhook_lab_id = _receipt_lab_id(cur, payload)
+    # The first receipt is the sample's receipt. Each later receipt (another lab in the
+    # chain, or a second tube) is recorded per lab on its queue entry / ETA records.
     cur.execute("""
         UPDATE tat_sample
-        SET received_at=%s, arrived_at_lab=%s, status='arrived', updated_at=CURRENT_TIMESTAMP
+        SET received_at=COALESCE(received_at, %s), arrived_at_lab=COALESCE(arrived_at_lab, %s),
+            updated_at=CURRENT_TIMESTAMP
         WHERE id=%s
     """, (received_time, received_time, sample_id))
     _log(cur, {
-        "sample_id": sample_id, "bill_id": bill_id,
+        "sample_id": sample_id, "bill_id": bill_id, "lab_id": webhook_lab_id,
         "event_type": "sample_received", "ts": received_time,
-        "webhook_event_id": event_id, "notes": f"Sample arrived at lab: {acc_no}",
+        "webhook_event_id": event_id, "notes": f"Sample arrived at lab {webhook_lab_id}: {acc_no}",
     })
     # C-7 FIX: Create SLA records if they were skipped in BILL_GENERATE due to missing collected_at
     cur.execute("""
@@ -1168,27 +1258,80 @@ def _handle_sample_received(cur, event: Dict, payload: Dict) -> None:
         logger.info("[SAMPLE_RECEIVED] Created missing SLA for test_id=%d", m["id"])
     # ── Per-test routing ──────────────────────────────────────────────────────
     cur.execute("""
-        SELECT id, department_id, test_code, processing_time_mins
+        SELECT id, department_id, test_code, processing_time_mins,
+               external_report_id, external_test_id
         FROM tat_test_instance
-        WHERE sample_id=%s AND status NOT IN ('cancelled','invalidated','completed')
+        WHERE sample_id=%s AND is_current_cycle=1
+          AND status NOT IN ('cancelled','invalidated','completed')
     """, (sample_id,))
     tests = cur.fetchall()
-    # Check if this reception event explicitly specifies the destination lab
-    webhook_lab_raw = payload.get("labId")
-    ext_webhook_lab_id = webhook_lab_raw["labId"] if isinstance(webhook_lab_raw, dict) else (webhook_lab_raw or 0)
-    webhook_lab_id = None
-    if ext_webhook_lab_id:
-        cur.execute("SELECT id FROM tat_lab WHERE external_lab_id=%s LIMIT 1", (ext_webhook_lab_id,))
-        lr = cur.fetchone()
-        if lr:
-            webhook_lab_id = lr["id"]
-    lab_groups, any_unassigned = _route_tests(cur, sample_id, bill_id, tests, webhook_lab_id, received_time, event_id)
-    if any_unassigned:
+    cur.execute("""
+        SELECT test_instance_id, destination_lab_id, route_reason
+        FROM tat_processing_assignment
+        WHERE sample_id=%s AND assignment_status='assigned'
+    """, (sample_id,))
+    prev = {r["test_instance_id"]: r for r in cur.fetchall()}
+    # A test whose lab was confirmed by a receipt there is not moved by a receipt that
+    # does not name it.
+    confirmed = {tid: r["destination_lab_id"] for tid, r in prev.items()
+                 if r["route_reason"] == "webhook_received_at"}
+    received_ids = _received_test_ids(tests, payload)
+    if received_ids is not None:
+        # CrelioHealth lists the tests received at this lab: route those here; tests no
+        # lab has received yet are routed provisionally so they still get an ETA.
+        here = [t for t in tests if t["id"] in received_ids]
+        provisional = [t for t in tests if t["id"] not in received_ids and t["id"] not in prev]
+    else:
+        here = [t for t in tests if confirmed.get(t["id"]) in (None, webhook_lab_id)]
+        provisional = []
+    lab_groups, _ = _route_tests(cur, sample_id, bill_id, here, webhook_lab_id, received_time, event_id)
+    if provisional:
+        prov_groups, _ = _route_tests(cur, sample_id, bill_id, provisional, None, received_time, event_id)
+        for lab_id, lab_tests in prov_groups.items():
+            lab_groups.setdefault(lab_id, []).extend(lab_tests)
+    # Labs that lost tests to this receipt: drop their slot when nothing is left there,
+    # otherwise recalculate their ETA over the tests that remain.
+    moved_from = {prev[t["id"]]["destination_lab_id"] for t in here + provisional if t["id"] in prev}
+    for old_lab in moved_from - set(lab_groups):
+        cur.execute("""
+            SELECT COUNT(*) AS n
+            FROM tat_processing_assignment pa
+            JOIN tat_test_instance ti ON ti.id = pa.test_instance_id
+            WHERE pa.sample_id=%s AND pa.destination_lab_id=%s AND pa.assignment_status='assigned'
+              AND ti.is_current_cycle=1 AND ti.status NOT IN ('cancelled','invalidated','completed')
+        """, (sample_id, old_lab))
+        if cur.fetchone()["n"]:
+            _schedule_lab_groups(cur, sample_id, bill_id, {old_lab: []}, received_time, collected_at,
+                                 priority, tat_category, event_id, reuse_existing_slot=True)
+        else:
+            cur.execute("""
+                UPDATE tat_lab_queue SET status='cancelled', updated_at=CURRENT_TIMESTAMP
+                WHERE sample_id=%s AND lab_id=%s AND status NOT IN ('completed','cancelled','skipped')
+            """, (sample_id, old_lab))
+            cur.execute("""
+                UPDATE tat_lab_batch_assignment SET status='cancelled', updated_at=CURRENT_TIMESTAMP
+                WHERE sample_id=%s AND lab_id=%s AND status NOT IN ('missed','cancelled')
+            """, (sample_id, old_lab))
+            _log(cur, {
+                "sample_id": sample_id, "bill_id": bill_id, "lab_id": old_lab,
+                "event_type": "queue_lab_reassigned", "ts": _now(), "webhook_event_id": event_id,
+                "notes": f"All tests moved to another lab; slot at lab {old_lab} released",
+            })
+    cur.execute("""
+        SELECT COUNT(*) AS n FROM tat_test_instance
+        WHERE sample_id=%s AND is_current_cycle=1 AND processing_lab_id IS NULL
+          AND status NOT IN ('cancelled','invalidated','completed')
+    """, (sample_id,))
+    if cur.fetchone()["n"]:
         cur.execute("UPDATE tat_sample SET status='unassigned' WHERE id=%s", (sample_id,))
         logger.warning("[ROUTING] Sample %d has unassigned tests", sample_id)
     else:
         # L-2 FIX: Only set arrived if all tests were assigned
-        cur.execute("UPDATE tat_sample SET status='arrived' WHERE id=%s", (sample_id,))
+        cur.execute("""
+            UPDATE tat_sample
+            SET status = CASE WHEN status='partially_complete' THEN status ELSE 'arrived' END
+            WHERE id=%s
+        """, (sample_id,))
     # ── Per-lab batch slot + ETA ──────────────────────────────────────────────
     _schedule_lab_groups(cur, sample_id, bill_id, lab_groups, received_time, collected_at,
                          priority, tat_category, event_id)
@@ -1208,6 +1351,82 @@ def _handle_sample_received(cur, event: Dict, payload: Dict) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # SAMPLE_REJECTED handler
 # ─────────────────────────────────────────────────────────────────────────────
+def _estimate_external_eta(cur, sample_id: int, bill_id: int, collected_at: datetime,
+                           sent_time: datetime, external_lab: str) -> None:
+    """The sample has left for an external lab, so it gets no batch slot, but its SLA keeps
+    running. Per test, ETA = hand-off time + the vendor's turnaround from tat_lab_edos
+    (committed TAT, else processing time + outsource buffer), else the test's own
+    processing time. Results still close the test via the normal report webhooks."""
+    tat_category = resolve_client_category(cur, bill_id)
+    cur.execute("""
+        SELECT id, test_code, processing_time_mins FROM tat_test_instance
+        WHERE sample_id=%s AND is_current_cycle=1
+          AND status NOT IN ('cancelled','invalidated','completed')
+    """, (sample_id,))
+    for t in cur.fetchall():
+        cur.execute("""
+            SELECT lab_id, processing_time_mins, committed_tat_hours,
+                   COALESCE(outsource_buffer_mins, 0) AS buffer_mins
+            FROM tat_lab_edos
+            WHERE test_code=%s AND is_outsourced=1 AND is_active=1
+            ORDER BY COALESCE(outsource_vendor_name ILIKE %s, FALSE) DESC, id
+            LIMIT 1
+        """, (t["test_code"], external_lab))
+        vendor = cur.fetchone()
+        if vendor and vendor["committed_tat_hours"]:
+            mins = int(float(vendor["committed_tat_hours"]) * 60)
+        elif vendor:
+            mins = vendor["processing_time_mins"] + vendor["buffer_mins"]
+        else:
+            mins = t["processing_time_mins"] or cfg.DEFAULT_PROCESSING_TIME_MINS
+        vendor_lab = vendor["lab_id"] if vendor else None
+        end = sent_time + timedelta(minutes=mins)
+        tat_mins = get_predefined_tat_mins(cur, t["test_code"], tat_category)
+        breached, pred_mins, breach_by = detect_tat_breach(collected_at, end, tat_mins / 60 if tat_mins else None)
+        cur.execute("""
+            INSERT INTO tat_eta_record
+              (test_instance_id, queue_entry_id, sample_id, bill_id, lab_id,
+               collection_time, arrival_time_at_lab, estimated_start_time, estimated_end_time,
+               queue_wait_mins, lab_processing_mins, total_eta_mins,
+               predefined_tat_mins, is_tat_breached, breach_by_mins, version, recalculation_reason)
+            VALUES (%s,NULL,%s,%s,%s,%s,%s,%s,%s,0,%s,%s,%s,%s,%s,1,'sent_to_external')
+            ON CONFLICT (test_instance_id) DO UPDATE
+              SET queue_entry_id = NULL,
+                  lab_id = EXCLUDED.lab_id,
+                  arrival_time_at_lab = EXCLUDED.arrival_time_at_lab,
+                  estimated_start_time = EXCLUDED.estimated_start_time,
+                  estimated_end_time = EXCLUDED.estimated_end_time,
+                  queue_wait_mins = 0,
+                  lab_processing_mins = EXCLUDED.lab_processing_mins,
+                  total_eta_mins = EXCLUDED.total_eta_mins,
+                  predefined_tat_mins = EXCLUDED.predefined_tat_mins,
+                  is_tat_breached = EXCLUDED.is_tat_breached,
+                  breach_by_mins = EXCLUDED.breach_by_mins,
+                  recalculation_reason = EXCLUDED.recalculation_reason,
+                  version = tat_eta_record.version + 1,
+                  updated_at = CURRENT_TIMESTAMP
+        """, (
+            t["id"], sample_id, bill_id, vendor_lab,
+            collected_at, sent_time, sent_time, end,
+            mins, int((end - collected_at).total_seconds() / 60),
+            pred_mins, 1 if breached else 0, breach_by,
+        ))
+        cur.execute("""
+            INSERT INTO tat_processing_assignment
+              (sample_id, bill_id, test_instance_id, destination_lab_id, outsource_vendor_name,
+               predicted_eta, actual_processing_start, route_reason, assignment_status)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'outsourced')
+            ON CONFLICT (test_instance_id) DO UPDATE
+              SET destination_lab_id = EXCLUDED.destination_lab_id,
+                  outsource_vendor_name = EXCLUDED.outsource_vendor_name,
+                  predicted_eta = EXCLUDED.predicted_eta,
+                  actual_processing_start = EXCLUDED.actual_processing_start,
+                  route_reason = EXCLUDED.route_reason,
+                  assignment_status = 'outsourced',
+                  updated_at = CURRENT_TIMESTAMP
+        """, (sample_id, bill_id, t["id"], vendor_lab, external_lab[:256], end, sent_time,
+              f"sent_to_external:{external_lab}"[:128]))
+    _refresh_sample_eta(cur, sample_id)
 def _handle_sample_sent_to_external(cur, event: Dict, payload: Dict) -> None:
     event_id        = event["id"]
     acc_no          = _sample_accession(payload)
@@ -1246,10 +1465,11 @@ def _handle_sample_sent_to_external(cur, event: Dict, payload: Dict) -> None:
         WHERE sample_id=%s AND status NOT IN ('completed','cancelled','skipped')
     """, (sample_id,))
     cur.execute("""
-        UPDATE tat_processing_assignment
-        SET assignment_status='cancelled', updated_at=CURRENT_TIMESTAMP
-        WHERE sample_id=%s AND assignment_status='assigned'
+        UPDATE tat_lab_batch_assignment
+        SET status='cancelled', updated_at=CURRENT_TIMESTAMP
+        WHERE sample_id=%s AND status NOT IN ('missed','cancelled')
     """, (sample_id,))
+    _estimate_external_eta(cur, sample_id, bill_id, row["collected_at"] or sent_time, sent_time, external_lab)
     _log(cur, {
         "sample_id": sample_id, "bill_id": bill_id,
         "event_type": "sample_in_transit", "ts": sent_time,
@@ -1504,7 +1724,8 @@ def _handle_report_pdf(cur, event: Dict, payload: Dict) -> None:
         cur.execute("""
             SELECT ti.id, ti.sample_id, ti.bill_id
             FROM tat_test_instance ti
-            WHERE ti.external_report_id=%s LIMIT 1
+            WHERE ti.external_report_id=%s
+            ORDER BY ti.is_current_cycle DESC, ti.id DESC LIMIT 1
         """, (ext_report_id,))
         row = cur.fetchone()
         if row:
@@ -1605,6 +1826,14 @@ def _handle_sample_redrawn(cur, event: Dict, payload: Dict) -> None:
         SET status='cancelled', updated_at=CURRENT_TIMESTAMP
         WHERE sample_id=%s AND status NOT IN ('completed', 'cancelled', 'skipped')
     """, (sample_id,))
+    cur.execute("""
+        UPDATE tat_lab_batch_assignment SET status='cancelled', updated_at=CURRENT_TIMESTAMP
+        WHERE sample_id=%s AND status NOT IN ('missed','cancelled')
+    """, (sample_id,))
+    cur.execute("""
+        UPDATE tat_processing_assignment SET assignment_status='cancelled', updated_at=CURRENT_TIMESTAMP
+        WHERE sample_id=%s AND assignment_status='assigned'
+    """, (sample_id,))
     logger.info("[SAMPLE_REDRAWN] cancelled queue entries for sample_id=%d", sample_id)
     # ── Fetch the invalidated test instances to copy ──────────────────────────
     cur.execute("""
@@ -1684,7 +1913,7 @@ def _handle_sample_redrawn(cur, event: Dict, payload: Dict) -> None:
     cur.execute("""
         UPDATE tat_sample
         SET cycle_number=%s, redraw=1, collected_at=%s,
-            completed_tests=0, status='pending',
+            completed_tests=0, status='pending', received_at=NULL, arrived_at_lab=NULL,
             updated_at=CURRENT_TIMESTAMP
         WHERE id=%s
     """, (new_cycle, new_collection, sample_id))
@@ -1746,7 +1975,7 @@ def _check_sample_completion(cur, sample_id: int, bill_id: int, event_id: int) -
                 COUNT(*) FILTER (WHERE status IN ('completed', 'cancelled')) AS done_count,
                 COUNT(*) FILTER (WHERE status = 'completed') AS completed_count
             FROM tat_test_instance
-            WHERE sample_id=%s
+            WHERE sample_id=%s AND is_current_cycle=1   -- a redraw's invalidated cycle never completes
         )
         UPDATE tat_sample s
         SET completed_tests = (SELECT completed_count FROM counts),
@@ -1885,7 +2114,7 @@ def _handle_add_test_to_bill(cur, event: Dict, payload: Dict) -> None:
                external_dict_id, test_code, test_name, department_id, department_name,
                test_amount, processing_time_mins, processing_time_is_default, status)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending')
-            ON CONFLICT (external_report_id) DO NOTHING
+            ON CONFLICT (external_report_id) WHERE is_current_cycle = 1 DO NOTHING
             RETURNING id
         """, (
             sample_id, bill_id, event_id, ext_rpt_id, crelio_test_id,

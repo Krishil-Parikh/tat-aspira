@@ -75,6 +75,14 @@ def resolve_processing_times(
     )
     override_map = {r["test_code"]: r["processing_time_mins"] for r in cur.fetchall()}
 
+    # Tests this lab sends to an outside vendor take the vendor's hand-off buffer on top.
+    cur.execute(
+        "SELECT test_code, outsource_buffer_mins FROM tat_lab_edos WHERE lab_id=%s AND test_code = ANY(%s) "
+        "AND is_outsourced=1 AND is_active=1 AND outsource_buffer_mins IS NOT NULL",
+        (lab_id, test_codes)
+    )
+    buffer_map = {r["test_code"]: r["outsource_buffer_mins"] for r in cur.fetchall()}
+
     total_sum, total_max, missing = 0, 0, []
     for code in test_codes:
         if code in override_map:
@@ -105,6 +113,7 @@ def resolve_processing_times(
             else:
                 mins = default_mins
                 missing.append(code)
+        mins += buffer_map.get(code, 0)
         total_sum += mins
         if mins > total_max:
             total_max = mins

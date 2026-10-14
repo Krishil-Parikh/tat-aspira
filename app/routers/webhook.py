@@ -263,9 +263,33 @@ def _extract_event_key(body: Dict[str, Any]) -> Any:
     return key
 
 
-def _dedupe_key(webhook_type: str, event_key: Any, webhook_id: Optional[Any]) -> str:
+_SAMPLE_SCOPED_TYPES = {
+    WebhookType.SAMPLE_COLLECTED, WebhookType.SAMPLE_UNCOLLECTED, WebhookType.SAMPLE_RECEIVED,
+    WebhookType.SAMPLE_REJECTED, WebhookType.SAMPLE_DISMISSED, WebhookType.SAMPLE_REDRAWN,
+    WebhookType.SAMPLE_SENT_TO_EXTERNAL,
+}
+
+
+def _dedupe_scope(webhook_type: WebhookType, body: Dict[str, Any]) -> str:
+    """Sample events carry one billId for every tube on the bill, and CrelioHealth sends
+    Sample Received once per receiving lab. Scope them by accession (+ lab and accession
+    time for receipts) so a second tube, a second lab, or a re-receipt after a redraw is
+    not dropped as a duplicate; a retried delivery repeats all three and still dedupes."""
+    if webhook_type not in _SAMPLE_SCOPED_TYPES:
+        return ""
+    acc = body.get("accessionNo") or body.get("sampleId") or body.get("sampleID") or body.get("identifier") or ""
+    if isinstance(acc, list):
+        acc = acc[0] if acc else ""
+    if webhook_type != WebhookType.SAMPLE_RECEIVED:
+        return str(acc)[:100]
+    lab = body.get("internalLabId") or _extract_lab_id(body)
+    when = body.get("accessionDate") or body.get("receivedTime") or ""
+    return f"{str(acc)[:100]}:{lab}:{str(when)[:32]}"
+
+
+def _dedupe_key(webhook_type: str, event_key: Any, webhook_id: Optional[Any], scope: str = "") -> str:
     webhook_id_part = webhook_id if webhook_id is not None else "null"
-    return f"{webhook_type}:{event_key}:{webhook_id_part}"
+    return f"{webhook_type}:{event_key}:{webhook_id_part}:{scope}"
 
 
 @router.post("", status_code=202, response_model=None)
@@ -318,7 +342,8 @@ async def ingest_webhook(request: Request):
     clean_body = body if webhook_type == WebhookType.REPORT_PDF else _strip_base64(body)
     payload_hash = _sha256(orjson.dumps(clean_body, option=orjson.OPT_SORT_KEYS))
 
-    dedupe_key = _dedupe_key(webhook_type.value, event_key, webhook_id)
+    dedupe_scope = _dedupe_scope(webhook_type, body)
+    dedupe_key = _dedupe_key(webhook_type.value, event_key, webhook_id, dedupe_scope)
     redis_new = _idem_guard.check_and_mark("webhook", dedupe_key)
     if not redis_new:
         logger.info(
@@ -338,7 +363,7 @@ async def ingest_webhook(request: Request):
         )
         return ORJSONResponse(content={"status": "accepted", "duplicate": True}, status_code=202)
 
-    is_dup = await pgdb.check_duplicate_event(event_key, webhook_type.value, webhook_id)
+    is_dup = await pgdb.check_duplicate_event(event_key, webhook_type.value, webhook_id, dedupe_scope)
     if is_dup:
         logger.info(
             "duplicate event skipped layer=postgres key=%s type=%s webhook_id=%s",
@@ -367,6 +392,7 @@ async def ingest_webhook(request: Request):
                 "payload_hash": payload_hash,
                 "source_ip": source_ip,
                 "auth_token_hash": auth_token_hash,
+                "dedupe_scope": dedupe_scope,
             }
         )
     except Exception as exc:

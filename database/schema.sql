@@ -67,7 +67,10 @@ CREATE TABLE tat_webhook_event (
   error_message    TEXT         DEFAULT NULL,
   processed_at     TIMESTAMP    DEFAULT NULL,
   created_at       TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  CONSTRAINT uq_event_dedup UNIQUE (bill_id, webhook_type, webhook_id)
+  -- '<accession>:<labId>' for sample-level events, so each tube / each receiving lab
+  -- of one bill is a distinct event; '' for bill- and report-level events.
+  dedupe_scope     VARCHAR(160) NOT NULL DEFAULT '',
+  CONSTRAINT uq_event_dedup UNIQUE (bill_id, webhook_type, webhook_id, dedupe_scope)
 );
 CREATE INDEX idx_we_hash       ON tat_webhook_event(payload_hash);
 CREATE INDEX idx_we_bill_id    ON tat_webhook_event(bill_id);
@@ -374,10 +377,12 @@ CREATE TABLE tat_test_instance (
   status                     test_status_t NOT NULL DEFAULT 'draft',
   is_active                  SMALLINT      NOT NULL DEFAULT 1,
   created_at                 TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at                 TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  CONSTRAINT uq_ext_report  UNIQUE (external_report_id),
-  CONSTRAINT uq_sample_test UNIQUE (sample_id, external_test_id)
+  updated_at                 TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+-- A redraw keeps CrelioHealth's report / test ids on a new cycle row, so they are
+-- unique only among current-cycle rows; invalidated cycles stay as audit history.
+CREATE UNIQUE INDEX uq_ext_report  ON tat_test_instance(external_report_id) WHERE is_current_cycle = 1;
+CREATE UNIQUE INDEX uq_sample_test ON tat_test_instance(sample_id, external_test_id) WHERE is_current_cycle = 1;
 CREATE INDEX idx_ti_sample   ON tat_test_instance(sample_id);
 CREATE INDEX idx_ti_bill     ON tat_test_instance(bill_id);
 CREATE INDEX idx_ti_event    ON tat_test_instance(webhook_event_id);

@@ -21,20 +21,21 @@ def _now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-async def _insert_internal_webhook_event(conn, *, webhook_id: int, webhook_type: str, bill_id: int, lab_id: int, payload: dict) -> tuple[int, bool]:
+async def _insert_internal_webhook_event(conn, *, webhook_id: int, webhook_type: str, bill_id: int, lab_id: int,
+                                        payload: dict, dedupe_scope: str = "") -> tuple[int, bool]:
     row = await conn.fetchrow(
         """
         WITH ins AS (
-            INSERT INTO tat_webhook_event (webhook_id, webhook_type, bill_id, lab_id, payload, status)
-            VALUES ($1, $2, $3, $4, $5, 'received')
-            ON CONFLICT (bill_id, webhook_type, webhook_id) DO NOTHING
+            INSERT INTO tat_webhook_event (webhook_id, webhook_type, bill_id, lab_id, payload, status, dedupe_scope)
+            VALUES ($1, $2, $3, $4, $5, 'received', $6)
+            ON CONFLICT (bill_id, webhook_type, webhook_id, dedupe_scope) DO NOTHING
             RETURNING id, FALSE AS duplicate
         )
         SELECT id, duplicate FROM ins
         UNION ALL
         SELECT id, TRUE AS duplicate
         FROM tat_webhook_event
-        WHERE bill_id = $3 AND webhook_type = $2 AND webhook_id = $1
+        WHERE bill_id = $3 AND webhook_type = $2 AND webhook_id = $1 AND dedupe_scope = $6
         LIMIT 1
         """,
         webhook_id,
@@ -42,10 +43,28 @@ async def _insert_internal_webhook_event(conn, *, webhook_id: int, webhook_type:
         bill_id,
         lab_id,
         json.dumps(payload),
+        dedupe_scope,
     )
     if not row:
         raise HTTPException(500, "Webhook event insert failed")
     return row["id"], row["duplicate"]
+
+async def _internal_receipt_payload(conn, sample, ext_bill_id: int, lab_id: int, now: datetime) -> dict:
+    """SAMPLE_RECEIVED payload for a UI receipt. labId carries the CrelioHealth (external)
+    lab id like a real webhook; internalLabId lets the handler use the chosen lab even when
+    the lab has no external id mapped."""
+    lab = await conn.fetchrow("SELECT id, external_lab_id FROM tat_lab WHERE id=$1 AND is_active=1", lab_id)
+    if not lab:
+        raise HTTPException(400, f"Lab {lab_id} not found or inactive")
+    return {
+        "webhook_type": "SAMPLE_RECEIVED",
+        "bill_id": ext_bill_id,
+        "sampleId": sample["external_sample_id"],
+        "accessionNo": sample["accession_no"],
+        "labId": lab["external_lab_id"] or lab_id,
+        "internalLabId": lab_id,
+        "receivedTime": now.isoformat(),
+    }
 
 # ── Logistics ─────────────────────────────────────────────────────────────────
 
@@ -103,14 +122,7 @@ async def confirm_delivery(req: DeliveryRequest, user: UserSession = Depends(req
             raise HTTPException(404, "Sample not found")
 
         ext_bill_id = sample["external_bill_id"] or sample["internal_bill_id"]
-        payload = {
-            "webhook_type": "SAMPLE_RECEIVED",
-            "bill_id": ext_bill_id,
-            "sampleId": sample["external_sample_id"],
-            "accessionNo": sample["accession_no"],
-            "labId": req.lab_id,
-            "receivedTime": now.isoformat(),
-        }
+        payload = await _internal_receipt_payload(conn, sample, ext_bill_id, req.lab_id, now)
         event_id, duplicate = await _insert_internal_webhook_event(
             conn,
             webhook_id=req.sample_id,
@@ -118,6 +130,7 @@ async def confirm_delivery(req: DeliveryRequest, user: UserSession = Depends(req
             bill_id=ext_bill_id,
             lab_id=req.lab_id,
             payload=payload,
+            dedupe_scope=f"{sample['accession_no'] or req.sample_id}:{req.lab_id}",
         )
         if not duplicate:
             process_webhook_task.delay(event_id)
@@ -168,14 +181,7 @@ async def lab_confirm_receipt(req: LabReceiptRequest, user: UserSession = Depend
             raise HTTPException(404, "Sample not found")
 
         ext_bill_id = sample["external_bill_id"] or sample["internal_bill_id"]
-        payload = {
-            "webhook_type": "SAMPLE_RECEIVED",
-            "bill_id": ext_bill_id,
-            "sampleId": sample["external_sample_id"],
-            "accessionNo": sample["accession_no"],
-            "labId": req.lab_id,
-            "receivedTime": now.isoformat(),
-        }
+        payload = await _internal_receipt_payload(conn, sample, ext_bill_id, req.lab_id, now)
         event_id, duplicate = await _insert_internal_webhook_event(
             conn,
             webhook_id=req.sample_id,
@@ -183,6 +189,7 @@ async def lab_confirm_receipt(req: LabReceiptRequest, user: UserSession = Depend
             bill_id=ext_bill_id,
             lab_id=req.lab_id,
             payload=payload,
+            dedupe_scope=f"{sample['accession_no'] or req.sample_id}:{req.lab_id}",
         )
         await conn.execute(
             "UPDATE tat_sample SET arrived_at_lab=$1, status='arrived', updated_at=$1 WHERE id=$2",
