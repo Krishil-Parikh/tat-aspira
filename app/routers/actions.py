@@ -204,10 +204,18 @@ async def admit_sample(req: AdmitSampleRequest, user: UserSession = Depends(requ
 async def get_pickup_queue(user: UserSession = Depends(require_role(['logistics', 'admin']))):
     from app.pg_database import _pool
     rows = await _pool.fetch("""
-        SELECT s.id, s.accession_no, s.priority, s.status,
+        SELECT s.id, s.accession_no, s.status,
+               CASE WHEN s.is_urgent = 1 OR s.priority <= 1 THEN 'URGENT'
+                    WHEN s.priority <= 3 THEN 'HIGH' ELSE 'NORMAL' END AS priority,
                s.collected_at, s.assigned_lab_id,
                b.patient_name, b.external_bill_id, b.org_name AS pickup_location,
-               l.lab_name AS drop_location,
+               -- where the tube goes: the labs its tests are routed to (a split order has several)
+               COALESCE((
+                   SELECT string_agg(DISTINCT tl.lab_name, ', ')
+                   FROM tat_test_instance ti JOIN tat_lab tl ON tl.id = ti.processing_lab_id
+                   WHERE ti.sample_id = s.id AND ti.is_current_cycle = 1
+                     AND ti.status NOT IN ('cancelled', 'invalidated')
+               ), l.lab_name) AS drop_location,
                COALESCE(e.total_eta_mins, 0) AS total_eta_mins,
                COALESCE(e.is_tat_breached, 0) AS is_tat_breached
         FROM tat_sample s
@@ -216,7 +224,7 @@ async def get_pickup_queue(user: UserSession = Depends(require_role(['logistics'
         LEFT JOIN tat_eta e ON e.sample_id = s.id
         WHERE s.status IN ('pending', 'in_transit')
            OR (s.status = 'arrived' AND s.received_at >= CURRENT_DATE)   -- "Delivered today"
-        ORDER BY s.priority DESC, s.collected_at ASC NULLS LAST
+        ORDER BY s.priority ASC, s.collected_at ASC NULLS LAST   -- priority 1 = most urgent
         LIMIT 100
     """)
     return {"queue": [dict(r) for r in rows], "total": len(rows)}

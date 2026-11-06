@@ -103,7 +103,9 @@ export function Sidebar({ isOpen, setIsOpen }: SidebarProps) {
 
       <nav className="flex-1 px-4 space-y-1 overflow-y-auto">
         {filteredNavItems.map((item) => {
-          const isActive = pathname === item.href || pathname.startsWith(item.href + '/');
+          // '/dashboard' is the home page only; other items also cover their sub-pages
+          const isActive = pathname === item.href
+            || (item.href !== '/dashboard' && pathname.startsWith(item.href + '/'));
           return (
             <Link key={item.label} href={item.href} onClick={() => setIsOpen(false)}>
               <motion.div
