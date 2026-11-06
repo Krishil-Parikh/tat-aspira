@@ -22,6 +22,13 @@ def _now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def _iso_utc(dt: datetime) -> str:
+    """ISO time with an explicit UTC offset for payloads we build ourselves. The webhook
+    processor reads offset-less times as server-local (CrelioHealth sends IST wall-clock
+    times), so a bare UTC isoformat() landed 5h30 early on an Asia/Kolkata server."""
+    return (dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)).isoformat()
+
+
 async def _insert_internal_webhook_event(conn, *, webhook_id: int, webhook_type: str, bill_id: int, lab_id: int,
                                         payload: dict, dedupe_scope: str = "") -> tuple[int, bool]:
     row = await conn.fetchrow(
@@ -75,7 +82,7 @@ async def _internal_receipt_payload(conn, sample, ext_bill_id: int, lab_id: int,
         "accessionNo": sample["accession_no"],
         "labId": lab["external_lab_id"] or lab_id,
         "internalLabId": lab_id,
-        "receivedTime": received.isoformat(),
+        "receivedTime": _iso_utc(received),
     }
     if test_codes:
         codes = {c.strip() for c in test_codes}
@@ -226,7 +233,10 @@ async def confirm_pickup(req: PickupRequest, user: UserSession = Depends(require
         if not sample: raise HTTPException(404, "Sample not found")
         async with conn.transaction():
             await conn.execute("UPDATE tat_sample SET status='in_transit', updated_at=$1 WHERE id=$2", now, req.sample_id)
-            await conn.execute("INSERT INTO tat_log (sample_id, bill_id, event_type, triggered_by, notes) VALUES ($1, $2, 'sample_picked_up', 'logistics_user', 'Picked up')", req.sample_id, sample["bill_id"])
+            await conn.execute(
+                "INSERT INTO tat_log (sample_id, bill_id, event_type, event_timestamp, triggered_by, notes) "
+                "VALUES ($1, $2, 'sample_picked_up', $3, $4, 'Picked up')",
+                req.sample_id, sample["bill_id"], now, user.email)
     return {"message": "Pickup confirmed"}
 
 class DeliveryRequest(BaseModel):
@@ -317,6 +327,8 @@ class LabReceiptRequest(BaseModel):
 @actions_router.post("/lab/confirm-receipt")
 async def lab_confirm_receipt(req: LabReceiptRequest, user: UserSession = Depends(require_role(['lab', 'admin']))):
     from app.pg_database import _pool
+    if user.role == 'lab' and req.lab_id != user.lab_id:
+        raise HTTPException(403, "You can only confirm receipts at your own lab")
     now = _now()
     async with _pool.acquire() as conn:
         sample = await conn.fetchrow("""
@@ -353,7 +365,14 @@ class TestStatusRequest(BaseModel):
 async def update_test_status(req: TestStatusRequest, user: UserSession = Depends(require_role(['lab', 'admin']))):
     from app.pg_database import _pool
     status_map = {"in_queue": "processing", "processing": "processing", "completed": "completed", "cancelled": "cancelled"}
-    db_status = status_map.get(req.status.lower(), "pending")
+    db_status = status_map.get(req.status.lower())
+    if db_status is None:
+        raise HTTPException(400, f"Unknown status '{req.status}'")
+    test = await _pool.fetchrow("SELECT processing_lab_id FROM tat_test_instance WHERE id=$1", req.test_instance_id)
+    if not test:
+        raise HTTPException(404, "Test instance not found")
+    if user.role == 'lab' and test["processing_lab_id"] != user.lab_id:
+        raise HTTPException(403, "This test is not assigned to your lab")
     await _pool.execute("UPDATE tat_test_instance SET status=$1, updated_at=CURRENT_TIMESTAMP WHERE id=$2", db_status, req.test_instance_id)
     return {"message": "Status updated"}
 
@@ -375,12 +394,14 @@ async def submit_test_result(req: SubmitResultRequest, user: UserSession = Depen
         """, req.test_instance_id, req.sample_id)
         if not test:
             raise HTTPException(404, "Test instance not found on this sample")
+        if user.role == 'lab' and test["processing_lab_id"] != user.lab_id:
+            raise HTTPException(403, "This test is not assigned to your lab")
         # CrelioHealth ids, as a real Report Submit carries them, so the handler finds the test
         # (it used to send the internal bill / test ids, which never matched).
         payload = {"webhook_type": "REPORT_SUBMIT", "billId": test["ext_bill_id"],
                    "labReportId": test["external_report_id"], "testID": test["external_test_id"],
                    "labId": test["processing_lab_id"], "testCode": test["test_code"],
-                   "result": req.result, "reportDate": now.isoformat()}
+                   "result": req.result, "reportDate": _iso_utc(now)}
         event_id, duplicate = await _insert_internal_webhook_event(
             conn,
             webhook_id=req.test_instance_id,
