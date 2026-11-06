@@ -53,3 +53,6 @@ scratch/
 
 # Python virtualenv (setup instructions use .venv)
 .venv/
+
+.vercel
+.env*
