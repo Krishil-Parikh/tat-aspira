@@ -94,6 +94,103 @@ def _receipt_scope(sample, sample_id: int, lab_id: int, received: datetime, test
     codes = ",".join(sorted(test_codes)) if test_codes else ""
     return f"{sample['accession_no'] or sample_id}:{lab_id}:{received.isoformat()}:{codes}"[:160]
 
+# ── Admit sample (UI) ─────────────────────────────────────────────────────────
+
+_ADMIT_PRIORITY = {"URGENT": 10, "HIGH": 7, "NORMAL": 5}   # BILL_GENERATE priority scale
+
+
+@actions_router.get("/admit-sample/options")
+async def admit_sample_options(user: UserSession = Depends(require_role(['admin', 'doctor']))):
+    """Tests the routing engine knows (tat_test_type_config) and the labs a sample can be
+    collected at, for the Admit Sample form."""
+    from app.pg_database import _pool
+    tests = await _pool.fetch("""
+        SELECT c.test_code, c.test_name, c.department_name, c.processing_time_mins,
+               ROUND(p.overall_tat_mins / 60.0, 1) AS tat_hours
+        FROM tat_test_type_config c
+        LEFT JOIN tat_predefined_tat p
+          ON p.test_code = c.test_code AND p.client_category = 'B2B' AND p.is_active = 1
+        WHERE c.is_active = 1
+        ORDER BY c.department_name, c.test_name
+    """)
+    labs = await _pool.fetch("""
+        SELECT id, lab_code, lab_name FROM tat_lab WHERE is_active = 1 ORDER BY lab_name
+    """)
+    return {"tests": [dict(r) for r in tests], "labs": [dict(r) for r in labs]}
+
+
+class AdmitSampleRequest(BaseModel):
+    patient_name: str
+    test_codes: List[str]
+    collection_lab_id: int
+    priority: str = "NORMAL"
+
+
+@actions_router.post("/admit-sample")
+async def admit_sample(req: AdmitSampleRequest, user: UserSession = Depends(require_role(['admin', 'doctor']))):
+    """Registers a walk-in sample as a CrelioHealth-shaped BILL_GENERATE event and runs it
+    through the normal webhook pipeline (routing, SLA, ETA). The browser used to post an
+    unsigned BILL_UPDATE for a bill that did not exist, which created nothing."""
+    from app.pg_database import _pool
+    codes = sorted({c.strip().upper() for c in req.test_codes if c and c.strip()})
+    name = req.patient_name.strip()[:120]
+    if not name:
+        raise HTTPException(400, "Patient name is required")
+    if not codes:
+        raise HTTPException(400, "Select at least one test")
+    priority = _ADMIT_PRIORITY.get(req.priority.upper())
+    if priority is None:
+        raise HTTPException(400, "priority must be URGENT, HIGH or NORMAL")
+
+    now = _now()
+    async with _pool.acquire() as conn:
+        lab = await conn.fetchrow(
+            "SELECT id, external_lab_id, lab_code, lab_name FROM tat_lab WHERE id=$1 AND is_active=1",
+            req.collection_lab_id,
+        )
+        if not lab:
+            raise HTTPException(400, f"Lab {req.collection_lab_id} not found or inactive")
+        tests = await conn.fetch("""
+            SELECT test_code, test_name, external_test_id, department_id
+            FROM tat_test_type_config WHERE is_active = 1 AND upper(test_code) = ANY($1::text[])
+        """, codes)
+        missing = sorted(set(codes) - {t["test_code"].upper() for t in tests})
+        if missing:
+            raise HTTPException(400, "Unknown test code(s): " + ", ".join(missing))
+
+        # Ids in a range CrelioHealth bills don't use (9xxxxxxxxxxxx), unique per millisecond.
+        bill_id = 9_000_000_000_000 + int(now.timestamp() * 1000) % 1_000_000_000_000
+        accession = f"ADM-{bill_id % 100_000_000:08d}"
+        collected = now.isoformat() + "Z"
+        payload = {
+            "webhook_type": "BILL_GENERATE",
+            "billId": bill_id,
+            "labId": {"labId": lab["external_lab_id"] or lab["id"], "labName": lab["lab_code"]},
+            "orgId": {"orgId": None, "orgFullName": "Walk-in (Admit Sample)"},
+            "patientName": name,
+            "collectionTime": collected,
+            "billTime": collected,
+            "priority": priority,
+            "labReportDetails": [
+                {
+                    "labReportId": bill_id * 100 + i,
+                    "collectedSampleId": {"accessionNo": accession, "collectionTime": collected},
+                    "reportID": {"testID": t["external_test_id"], "testCode": t["test_code"],
+                                 "testName": t["test_name"], "departmentId": t["department_id"]},
+                }
+                for i, t in enumerate(tests, start=1)
+            ],
+        }
+        event_id, _ = await _insert_internal_webhook_event(
+            conn, webhook_id=0, webhook_type="BILL_GENERATE", bill_id=bill_id,   # webhook_id is INT
+            lab_id=lab["external_lab_id"] or lab["id"], payload=payload,
+        )
+    process_webhook_task.delay(event_id)
+    logger.info("[ADMIT] bill=%d accession=%s tests=%s lab=%s by=%s",
+                bill_id, accession, codes, lab["lab_code"], user.email)
+    return {"bill_id": bill_id, "accession_no": accession, "event_id": event_id,
+            "collection_lab": lab["lab_name"], "tests": [t["test_code"] for t in tests]}
+
 # ── Logistics ─────────────────────────────────────────────────────────────────
 
 @actions_router.get("/logistics/pickup-queue")
@@ -110,7 +207,8 @@ async def get_pickup_queue(user: UserSession = Depends(require_role(['logistics'
         JOIN tat_bill b ON b.id = s.bill_id
         LEFT JOIN tat_lab l ON l.id = s.assigned_lab_id
         LEFT JOIN tat_eta e ON e.sample_id = s.id
-        WHERE s.status IN ('routed', 'pending', 'in_transit', 'arrived')
+        WHERE s.status IN ('pending', 'in_transit')
+           OR (s.status = 'arrived' AND s.received_at >= CURRENT_DATE)   -- "Delivered today"
         ORDER BY s.priority DESC, s.collected_at ASC NULLS LAST
         LIMIT 100
     """)
@@ -171,7 +269,7 @@ async def confirm_delivery(req: DeliveryRequest, user: UserSession = Depends(req
 @actions_router.get("/logistics/delivery-status")
 async def get_delivery_status(user: UserSession = Depends(require_role(['logistics', 'admin']))):
     from app.pg_database import _pool
-    rows = await _pool.fetch("SELECT s.id, s.accession_no, s.status, b.patient_name, l.lab_name FROM tat_sample s JOIN tat_bill b ON b.id = s.bill_id LEFT JOIN tat_lab l ON l.id = s.assigned_lab_id WHERE s.status IN ('in_transit', 'arrived', 'routed') ORDER BY s.updated_at DESC LIMIT 100")
+    rows = await _pool.fetch("SELECT s.id, s.accession_no, s.status, b.patient_name, l.lab_name FROM tat_sample s JOIN tat_bill b ON b.id = s.bill_id LEFT JOIN tat_lab l ON l.id = s.assigned_lab_id WHERE s.status IN ('in_transit', 'arrived') ORDER BY s.updated_at DESC LIMIT 100")
     return {"samples": [dict(r) for r in rows]}
 
 # ── Lab User ──────────────────────────────────────────────────────────────────
@@ -180,16 +278,33 @@ async def get_delivery_status(user: UserSession = Depends(require_role(['logisti
 async def get_lab_work_queue(lab_id: int, user: UserSession = Depends(require_role(['lab', 'admin']))):
     if user.role == 'lab' and user.lab_id != lab_id: raise HTTPException(403, "Forbidden")
     from app.pg_database import _pool
+    # Current-cycle tests only (a redraw's invalidated tests are not work). arrived_at_lab is
+    # set once this lab has confirmed receipt, so the UI only offers "Confirm receipt" before.
+    # priority: 1 = most urgent, so ascending.
     rows = await _pool.fetch("""
-        SELECT s.id AS sample_id, s.accession_no, s.priority, s.status AS sample_status, b.patient_name,
+        SELECT s.id AS sample_id, s.accession_no, s.status AS sample_status, b.patient_name,
+               CASE WHEN s.is_urgent = 1 OR s.priority <= 1 THEN 'URGENT'
+                    WHEN s.priority <= 3 THEN 'HIGH' ELSE 'NORMAL' END AS priority,
                ti.id AS test_instance_id, ti.test_code, ti.test_name, ti.status AS test_status,
-               e.estimated_end_time, e.is_tat_breached
+               CASE WHEN pa.route_reason = 'webhook_received_at' THEN r.arrival_time_at_lab END AS arrived_at_lab,
+               COALESCE(r.estimated_end_time, e.estimated_end_time) AS estimated_end_time,
+               e.is_tat_breached
         FROM tat_sample s
         JOIN tat_bill b ON b.id = s.bill_id
         JOIN tat_test_instance ti ON ti.sample_id = s.id
         LEFT JOIN tat_eta e ON e.sample_id = s.id
-        WHERE ti.processing_lab_id = $1 AND ti.status NOT IN ('completed', 'cancelled')
-        ORDER BY s.priority DESC, e.estimated_end_time ASC LIMIT 200
+        LEFT JOIN LATERAL (
+            SELECT route_reason FROM tat_processing_assignment
+            WHERE test_instance_id = ti.id AND assignment_status = 'assigned'
+            ORDER BY id DESC LIMIT 1
+        ) pa ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT arrival_time_at_lab, estimated_end_time FROM tat_eta_record
+            WHERE test_instance_id = ti.id ORDER BY id DESC LIMIT 1
+        ) r ON TRUE
+        WHERE ti.processing_lab_id = $1 AND ti.is_current_cycle = 1
+          AND ti.status NOT IN ('completed', 'cancelled', 'invalidated')
+        ORDER BY s.priority ASC, estimated_end_time ASC NULLS LAST LIMIT 200
     """, lab_id)
     return {"lab_id": lab_id, "work_items": [dict(r) for r in rows]}
 
@@ -447,6 +562,19 @@ async def admin_override_routing(
                     "UPDATE tat_lab_queue SET lab_id=$1, updated_at=CURRENT_TIMESTAMP WHERE sample_id=$2 AND status NOT IN ('completed','cancelled')",
                     req.new_lab_id, req.sample_id
                 )
+
+            # A sample that was unassigned leaves that state once every open test has a lab.
+            await conn.execute(
+                """UPDATE tat_sample
+                   SET status = (CASE WHEN received_at IS NULL THEN 'pending' ELSE 'arrived' END)::sample_status_t,
+                       updated_at = CURRENT_TIMESTAMP
+                   WHERE id = $1 AND status = 'unassigned'
+                     AND NOT EXISTS (
+                         SELECT 1 FROM tat_test_instance
+                         WHERE sample_id = $1 AND is_current_cycle = 1 AND processing_lab_id IS NULL
+                           AND status NOT IN ('completed', 'cancelled', 'invalidated'))""",
+                req.sample_id,
+            )
 
             # Audit log
             await conn.execute(

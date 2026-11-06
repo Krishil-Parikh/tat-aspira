@@ -72,8 +72,11 @@ export default function LabDetailPage() {
 
   // Derived: delayed = TAT breaches (samples where actual > expected)
   const delayed = kpi.tat_breaches ?? 0;
-  const successRate = kpi.total_tests > 0
-    ? Math.round(((kpi.completed_tests - delayed) / kpi.total_tests) * 100)
+  // Share of the lab's (non-cancelled) tests that are finished. TAT breaches are reported
+  // separately (SLA compliance); subtracting them here gave negative percentages.
+  const activeTests = (kpi.total_tests ?? 0) - (kpi.cancelled_tests ?? 0);
+  const successRate = activeTests > 0
+    ? Math.min(100, Math.round(((kpi.completed_tests ?? 0) / activeTests) * 100))
     : 100;
 
   return (
@@ -105,7 +108,7 @@ export default function LabDetailPage() {
           { label: 'Total Tests',  value: kpi.total_tests,     color: '',                icon: Layers },
           { label: 'Completed',    value: kpi.completed_tests,  color: 'text-success-text', icon: CheckCircle2 },
           { label: 'Delayed',      value: delayed,              color: delayed > 0 ? 'text-red-400' : '', icon: AlertCircle },
-          { label: 'Success Rate', value: `${successRate}%`,   color: successRate >= 90 ? 'text-success-text' : 'text-amber-500', icon: ShieldCheck },
+          { label: 'Completion Rate', value: `${successRate}%`,   color: successRate >= 90 ? 'text-success-text' : 'text-amber-500', icon: ShieldCheck },
         ].map((m, i) => (
           <motion.div
             key={m.label}

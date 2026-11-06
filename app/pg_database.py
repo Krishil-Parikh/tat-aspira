@@ -923,8 +923,11 @@ async def get_dashboard_stats() -> Dict[str, Any]:
       (SELECT COUNT(*) FROM tat_sample WHERE status = 'delayed')                      AS delayed_samples,
       (SELECT COUNT(*) FROM tat_sample WHERE status = 'cancelled')                    AS cancelled_samples,
       (SELECT COUNT(*) FROM tat_eta   WHERE is_tat_breached = 1)                      AS tat_breaches,
-      (SELECT COUNT(*) FROM tat_bill  WHERE bill_status_type = 'active')              AS active_bills,
-      (SELECT COUNT(*) FROM tat_lab   WHERE is_available = 1 AND is_active = 1)       AS labs_available
+      (SELECT COUNT(*) FROM tat_bill  WHERE bill_status_type IN ('preview','active'))            AS active_bills,
+      (SELECT COUNT(*) FROM tat_lab   WHERE is_available = 1 AND is_active = 1)       AS labs_available,
+      -- pipeline stages: not yet at the processing lab / at the lab and not finished
+      (SELECT COUNT(*) FROM tat_sample WHERE status IN ('draft','unassigned','pending','queued','in_transit')) AS awaiting_receipt_samples,
+      (SELECT COUNT(*) FROM tat_sample WHERE status IN ('arrived','processing','partially_complete','delayed'))  AS at_lab_samples
     """)
     return dict(row)
 
@@ -958,7 +961,7 @@ async def get_dashboard_stats_extended() -> dict:
       (SELECT COUNT(*) FROM tat_sample WHERE status = 'delayed')                         AS delayed_samples,
       (SELECT COUNT(*) FROM tat_sample WHERE status = 'cancelled')                       AS cancelled_samples,
       (SELECT COUNT(*) FROM tat_eta   WHERE is_tat_breached = 1)                         AS tat_breaches,
-      (SELECT COUNT(*) FROM tat_bill  WHERE bill_status_type = 'active')                 AS active_bills,
+      (SELECT COUNT(*) FROM tat_bill  WHERE bill_status_type IN ('preview','active'))               AS active_bills,
       (SELECT COUNT(*) FROM tat_lab   WHERE is_available = 1 AND is_active = 1)          AS labs_available,
       (SELECT COUNT(*) FROM tat_lab_batch_assignment WHERE status = 'assigned')          AS pending_batch_count,
       (SELECT COUNT(*) FROM tat_lab_batch_assignment WHERE status = 'missed')            AS missed_batch_count,
@@ -1125,7 +1128,7 @@ async def get_lab_dashboard(lab_id: int) -> Dict:
     # Active work queue for this lab
     queue_rows = await _pool.fetch("""
         SELECT
-            s.id AS sample_id, s.accession_no, s.priority,
+            s.id AS sample_id, s.accession_no, s.priority, $1::int AS lab_id,
             s.status AS sample_status, s.arrived_at_lab,
             b.patient_name, b.external_bill_id,
             ti.id AS test_instance_id, ti.test_code, ti.test_name,
@@ -1137,10 +1140,10 @@ async def get_lab_dashboard(lab_id: int) -> Dict:
         JOIN tat_test_instance ti ON ti.sample_id = s.id
         LEFT JOIN tat_eta e ON e.sample_id = s.id
         LEFT JOIN tat_lab_batch_assignment lba ON lba.sample_id = s.id AND lba.lab_id = $1
-        WHERE ti.processing_lab_id = $1
-          AND ti.status NOT IN ('completed', 'cancelled')
+        WHERE ti.processing_lab_id = $1 AND ti.is_current_cycle = 1
+          AND ti.status NOT IN ('completed', 'cancelled', 'invalidated')
           AND s.status NOT IN ('completed', 'cancelled')
-        ORDER BY s.priority DESC, e.estimated_end_time ASC NULLS LAST
+        ORDER BY s.priority ASC, e.estimated_end_time ASC NULLS LAST   -- priority 1 = most urgent
         LIMIT 100
     """, lab_id)
 

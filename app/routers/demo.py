@@ -77,6 +77,7 @@ async def bill_journey(external_bill_id: int):
         "patient": bill["patient_name"],
         "collected_at_lab": bill["collected_at_lab"],
         "samples": [{
+            "sample_id": s["id"],
             "accession": s["accession_no"],
             "status": s["status"],
             "cycle": s["cycle_number"],

@@ -4,6 +4,7 @@ import { motion } from 'motion/react';
 import { useRouter } from 'next/navigation';
 import { ShieldCheck, Lock, User, ArrowRight, Activity, Database } from 'lucide-react';
 import { cn } from '@/components/ui/utils';
+import { login } from '@/app/lib/api';
 
 export default function LoginPage() {
   const router = useRouter();
@@ -17,44 +18,17 @@ export default function LoginPage() {
     setIsLoading(true);
     setError('');
 
-    // Roles from PRD
-    const users: Record<string, { role: string, labId?: number }> = {
-      'admin@aspira.com': { role: 'admin' },
-      'logistics@aspira.com': { role: 'logistics' },
-      'doctor@aspira.com': { role: 'doctor' },
-      // Lab Managers from Demo Init
-      'ghk.manager@aspira.com': { role: 'lab', labId: 1 },
-      'nm.manager@aspira.com': { role: 'lab', labId: 2 },
-      'shobha.manager@aspira.com': { role: 'lab', labId: 3 },
-      'kharghar.manager@aspira.com': { role: 'lab', labId: 4 },
-      'chembur.manager@aspira.com': { role: 'lab', labId: 5 },
-      'hoc.manager@aspira.com': { role: 'lab', labId: 6 },
-      'truecare.manager@aspira.com': { role: 'lab', labId: 7 },
-      'sso.manager@aspira.com': { role: 'lab', labId: 8 },
-      'os.manager@aspira.com': { role: 'lab', labId: 9 },
-      // Legacy test accounts
-      'lab_main@aspira.com': { role: 'lab', labId: 1 },
-      'lab_haem@aspira.com': { role: 'lab', labId: 2 },
-      'lab_biochem@aspira.com': { role: 'lab', labId: 3 },
-    };
-
-    // Simulate authentication
-    setTimeout(() => {
-      const user = users[email as keyof typeof users];
-      if (user && password === 'aspira123') {
-        // Set auth cookies. Email is now the primary session identifier for the backend.
-        document.cookie = `aspira_auth=true; path=/; max-age=86400`;
-        document.cookie = `aspira_email=${email}; path=/; max-age=86400`;
-        document.cookie = `aspira_role=${user.role}; path=/; max-age=86400`; // UI hint only
-        if (user.labId) {
-          document.cookie = `aspira_lab_id=${user.labId}; path=/; max-age=86400`; // UI hint only
-        }
-        router.push('/dashboard');
-      } else {
-        setError('Invalid credentials. Access denied by security protocol.');
-        setIsLoading(false);
-      }
-    }, 1500);
+    // The backend checks the password against tat_user and sets the signed session cookies
+    // (plus the aspira_role / aspira_lab_id hints the middleware and sidebar read).
+    try {
+      await login(email.trim(), password);
+      router.push('/dashboard');
+    } catch (err: any) {
+      setError(err?.message === 'Failed to fetch'
+        ? 'Cannot reach the server. Please try again in a moment.'
+        : 'Invalid email or password.');
+      setIsLoading(false);
+    }
   };
 
   return (

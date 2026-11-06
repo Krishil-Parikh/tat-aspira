@@ -12,6 +12,7 @@ Celery workers:
   celery -A app.workers.celery_app beat   --loglevel=info
 """
 from __future__ import annotations
+import asyncio
 import logging
 import os
 import time
@@ -22,6 +23,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app import pg_database as pgdb
+from config.settings import cfg
+from app.services import keepalive
 from app.core.hot_cache import _redis as _hot_redis
 from app.routers.webhook import router as webhook_router
 from app.routers.demo import router as demo_router
@@ -77,8 +80,15 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("Redis unavailable — cache/queue features degraded: %s", exc)
 
+    # Keep-alive for hosts that sleep when idle (Render free tier); off unless a URL is set
+    keepalive_task = None
+    if cfg.KEEPALIVE_URL:
+        keepalive_task = asyncio.create_task(keepalive.run_loop())
+
     yield
 
+    if keepalive_task:
+        keepalive_task.cancel()
     await pgdb.close_db()
     logger.info("PostgreSQL pool closed")
 
@@ -96,16 +106,11 @@ app = FastAPI(
 )
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
-# Configure CORS for security - only allow specific origins in production
-allowed_origins = [
-    "http://localhost:3000",  # Next.js development
-    "http://localhost:3001",  # Alternative development port
-    "*",
-]
-
+# Only the dashboard origins (CORS_ORIGINS) may call the API with the session cookies.
+# A "*" here made Starlette echo back any Origin with credentials allowed.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=cfg.CORS_ORIGINS,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
     allow_credentials=True,
@@ -144,6 +149,14 @@ app.include_router(demo_router)
 @app.get("/health", tags=["Infra"])
 async def health():
     return {"status": "ok", "db": "postgresql", "version": "2.0.0"}
+
+
+@app.get("/api/keepalive", tags=["Infra"])
+async def keepalive_ping():
+    """Pings this backend's own /health through its public URL, but only inside the
+    keep-alive window (08:00–20:00 Asia/Kolkata by default). Called every 12 minutes by the
+    background loop; safe to call by hand to check the setup."""
+    return await keepalive.ping_health()
 
 
 @app.get("/", include_in_schema=False)

@@ -3,6 +3,7 @@ import React, { useEffect, useState } from 'react';
 import useSWR from 'swr';
 import { motion } from 'motion/react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import {
   Zap, Activity, Clock, AlertCircle, ShieldCheck, 
   Layers, CheckCircle2, FlaskConical, Database, FileText
@@ -26,8 +27,8 @@ function formatMins(totalMins: number | string | null | undefined): string {
 const PipelineStatus = ({ stats }: { stats: any }) => {
   const stages = [
     { label: "Bill", count: stats?.total_samples || 0 },
-    { label: "Split/Dispatch", count: stats?.active_samples || 0 },
-    { label: "Received/Processing", count: (stats?.active_samples || 0) - (stats?.tat_breaches || 0) }, // proxy metric for processing
+    { label: "Split/Dispatch", count: stats?.awaiting_receipt_samples || 0 },   // routed, not yet at the lab
+    { label: "Received/Processing", count: stats?.at_lab_samples || 0 },
     { label: "Completed", count: stats?.completed_samples || 0 },
   ];
   return (
@@ -50,6 +51,7 @@ const PipelineStatus = ({ stats }: { stats: any }) => {
 };
 
 export default function DashboardPage() {
+  const router = useRouter();
   const [mounted, setMounted] = useState(false);
   const [userRole, setUserRole] = useState<string | null>(null);
   const [processingId, setProcessingId] = useState<number | null>(null);
@@ -57,8 +59,12 @@ export default function DashboardPage() {
   useEffect(() => {
     setMounted(true);
     const cookies = document.cookie.split('; ');
-    const role = cookies.find(c => c.startsWith('aspira_role='))?.split('=')[1] || 'admin';
-    setUserRole(role.toLowerCase());
+    const role = (cookies.find(c => c.startsWith('aspira_role='))?.split('=')[1] || '').toLowerCase();
+    // Logistics and doctors have no overview page; the middleware already sends them to
+    // their own home, this covers client-side navigation.
+    if (role === 'logistics') { router.replace('/dashboard/logistics'); return; }
+    if (role === 'doctor') { router.replace('/dashboard/my-samples'); return; }
+    setUserRole(role);
   }, []);
 
   // Admin Data
@@ -236,7 +242,12 @@ export default function DashboardPage() {
   // ─── LAB USER VIEW ──────────────────────────────────────────────────────────
   if (userRole === 'lab') {
     const kpi = labData?.kpi || {};
-    const queue = labData?.work_queue || [];
+    // work_queue has one row per test; show one row per sample with its test names.
+    const queue = Object.values((labData?.work_queue || []).reduce((acc: Record<number, any>, row: any) => {
+      const cur = acc[row.sample_id] ??= { ...row, test_names: [] as string[] };
+      cur.test_names.push(row.test_name || row.test_code);
+      return acc;
+    }, {})) as any[];
 
     return (
       <div className="space-y-10 pb-20">
@@ -273,19 +284,20 @@ export default function DashboardPage() {
                   <div className="w-10 h-10 rounded-xl bg-surface-low flex items-center justify-center"><FlaskConical size={18} className="text-primary" /></div>
                   <div>
                     <p className="font-bold">{item.accession_no || `Sample #${item.sample_id}`}</p>
-                    <p className="text-[10px] text-muted font-black uppercase tracking-widest">{item.test_name}</p>
+                    <p className="text-[10px] text-muted font-black uppercase tracking-widest">{item.test_names.join(', ')}</p>
                   </div>
                 </div>
-                {item.sample_status === 'routed' && (
-                  <button 
+                {/* 'pending' = routed to this lab but not received yet */}
+                {item.sample_status === 'pending' && (
+                  <button
                     disabled={processingId === item.sample_id}
-                    onClick={() => handleQuickReceipt(item.sample_id, item.assigned_lab_id)}
+                    onClick={() => handleQuickReceipt(item.sample_id, item.lab_id)}
                     className="px-4 py-2 bg-success text-success-text font-black text-[10px] uppercase tracking-widest rounded-xl disabled:opacity-50"
                   >
                     {processingId === item.sample_id ? 'Confirming...' : 'Mark Received'}
                   </button>
                 )}
-                {item.sample_status !== 'routed' && (
+                {item.sample_status !== 'pending' && (
                   <span className="text-[10px] font-black uppercase px-3 py-1 bg-surface-high rounded-full">{item.sample_status}</span>
                 )}
               </div>

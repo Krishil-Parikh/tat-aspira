@@ -1,0 +1,71 @@
+# Render Blueprint — Aspira TAT backend (free tier)
+#
+#   Render dashboard → New → Blueprint → pick this repo + branch → paste the values it asks for:
+#     DATABASE_URL  Neon connection string (postgresql://...?sslmode=require)
+#     CORS_ORIGINS  the Vercel dashboard URL, e.g. https://tat-aspira.vercel.app
+#     LOGIN_PASSWORD  password for the dashboard accounts (don't use the default: the repo is public)
+#
+# Free web services sleep after 15 min without traffic; the API keeps itself awake
+# 08:00–20:00 Asia/Kolkata by pinging its own public URL every 12 min (app/services/keepalive.py,
+# GET /api/keepalive). Render sets RENDER_EXTERNAL_URL, which the keep-alive uses.
+#
+# DEMO_MODE=true processes CrelioHealth webhooks inside the API (no paid Celery worker).
+# The periodic Celery-beat checks (SLA at-risk, reconciliation sweep) need a worker and do
+# not run on this plan.
+
+services:
+  - type: web
+    name: aspira-tat-api
+    runtime: docker
+    plan: free
+    region: singapore
+    branch: krishil
+    autoDeployTrigger: commit
+    dockerfilePath: ./deploy/Dockerfile.backend
+    dockerContext: .
+    # One worker: 512 MB free instance, and one keep-alive loop.
+    dockerCommand: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1 --log-level info
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "8000"
+      - key: APP_ENV
+        value: development        # DEMO_MODE is refused when APP_ENV=production
+      - key: DEMO_MODE
+        value: "true"
+      - key: TZ
+        value: Asia/Kolkata
+      - key: DATABASE_URL
+        sync: false
+      - key: PG_POOL_MIN            # Neon free tier: keep the connection pool small
+        value: "1"
+      - key: PG_POOL_MAX
+        value: "5"
+      - key: CORS_ORIGINS
+        sync: false
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: aspira-tat-redis
+          property: connectionString
+      - key: SECRET_KEY
+        generateValue: true
+      - key: WEBHOOK_SHARED_SECRET
+        generateValue: true
+      - key: LOGIN_PASSWORD           # dashboard password; the repo is public, so not stored here
+        sync: false
+      - key: KEEPALIVE_INTERVAL_MINS
+        value: "12"
+      - key: KEEPALIVE_START_HOUR
+        value: "8"
+      - key: KEEPALIVE_END_HOUR
+        value: "20"
+      - key: KEEPALIVE_TIMEZONE
+        value: Asia/Kolkata
+
+  - type: keyvalue
+    name: aspira-tat-redis
+    plan: free
+    region: singapore
+    ipAllowList: []               # internal only: reachable from the API, not the internet
+    maxmemoryPolicy: allkeys-lru

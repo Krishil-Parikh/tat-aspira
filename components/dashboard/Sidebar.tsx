@@ -6,12 +6,14 @@ import { motion, AnimatePresence } from 'motion/react';
 import {
   LayoutDashboard, FlaskConical, FileText, Settings, LogOut,
   ChevronRight, Plus, Database, Truck, TestTube, BookOpen,
-  AlertTriangle, ClipboardList, Timer
+  AlertTriangle, ClipboardList, Timer, Bell
 } from 'lucide-react';
 import { cn } from '@/components/ui/utils';
+import { logout } from '@/app/lib/api';
+import { getSessionHint } from '@/app/lib/session';
 
 const allNavItems = [
-  { icon: LayoutDashboard, label: 'Frontier',        href: '/dashboard',             roles: ['admin', 'lab', 'logistics', 'doctor'] },
+  { icon: LayoutDashboard, label: 'Frontier',        href: '/dashboard',             roles: ['admin', 'lab'] },
   { icon: TestTube,        label: 'Test Tracking',    href: '/dashboard/tests',       roles: ['admin', 'lab', 'doctor'] },
   { icon: Database,        label: 'Lab Management',   href: '/dashboard/labs',        roles: ['admin'] },
   { icon: TestTube,        label: 'My Work Queue',    href: '/dashboard/lab-queue',   roles: ['lab'] },
@@ -19,11 +21,12 @@ const allNavItems = [
   { icon: Truck,           label: 'Logistics',        href: '/dashboard/logistics',   roles: ['logistics'] },
   { icon: ClipboardList,   label: 'My Samples',       href: '/dashboard/my-samples',  roles: ['doctor'] },
   { icon: Plus,            label: 'Admit Sample',     href: '/dashboard/accession',   roles: ['admin', 'doctor'] },
-  { icon: AlertTriangle,   label: 'Unassigned',       href: '/dashboard/admin',       roles: ['admin'], badge: 'admin' },
+  { icon: AlertTriangle,   label: 'Admin Controls',   href: '/dashboard/admin',       roles: ['admin'] },
+  { icon: Bell,            label: 'Alerts',           href: '/dashboard/alerts',      roles: ['admin'] },
   { icon: ClipboardList,   label: 'Audit Log',        href: '/dashboard/audit',       roles: ['admin'] },
-  { icon: Settings,        label: 'Admin Controls',   href: '/dashboard/admin',       roles: ['admin'] },
   { icon: FileText,        label: 'Catalog',          href: '/dashboard/catalog',     roles: ['admin'] },
   { icon: Timer,           label: 'TAT Configuration', href: '/dashboard/tat-config', roles: ['admin'] },
+  { icon: Settings,        label: 'System Status',    href: '/dashboard/settings',    roles: ['admin'] },
 ];
 
 interface SidebarProps {
@@ -36,19 +39,22 @@ export function Sidebar({ isOpen, setIsOpen }: SidebarProps) {
   const router   = useRouter();
   const [mounted, setMounted] = useState(false);
   const [userEmail, setUserEmail] = useState('');
-  const [userRole, setUserRole]   = useState('admin');
+  const [userRole, setUserRole]   = useState('');
 
   useEffect(() => {
     setMounted(true);
-    const cookies = document.cookie.split('; ');
-    const role = cookies.find(c => c.startsWith('aspira_role='))?.split('=')[1] || 'admin';
-    setUserRole(role.toLowerCase());
-    setUserEmail(`${role.toLowerCase()}@aspira.com`);
+    const session = getSessionHint();
+    setUserRole(session.role ?? '');
+    setUserEmail(session.name);
   }, []);
 
-  const handleLogout = () => {
-    document.cookie = "aspira_auth=; path=/; expires=Thu, 01 Jan 1970 00:00:01 GMT";
-    document.cookie = "aspira_role=; path=/; expires=Thu, 01 Jan 1970 00:00:01 GMT";
+  const handleLogout = async () => {
+    // The server clears the signed session cookies; the readable hints are cleared here too
+    // in case the server is unreachable.
+    await logout().catch(() => {});
+    for (const name of ['aspira_auth', 'aspira_role', 'aspira_lab_id', 'aspira_name']) {
+      document.cookie = `${name}=; path=/; expires=Thu, 01 Jan 1970 00:00:01 GMT`;
+    }
     router.push('/login');
   };
 

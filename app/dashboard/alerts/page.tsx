@@ -1,5 +1,5 @@
 "use client";
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import useSWR from 'swr';
 import { motion, AnimatePresence } from 'motion/react';
 import {
@@ -40,9 +40,37 @@ function ShieldCheckIcon({ className, size }: { className?: string; size?: numbe
   );
 }
 
+// Acknowledged / dismissed alert ids are kept in this browser so they survive a reload.
+const STORE_KEY = 'aspira_alerts_v1';
+
+function loadIds(key: 'read' | 'dismissed'): Set<number> {
+  try {
+    const raw = JSON.parse(localStorage.getItem(STORE_KEY) || '{}');
+    return new Set<number>(Array.isArray(raw[key]) ? raw[key] : []);
+  } catch {
+    return new Set();
+  }
+}
+
 export default function AlertsPage() {
   const [dismissed, setDismissed] = useState<Set<number>>(new Set());
   const [readSet, setReadSet]     = useState<Set<number>>(new Set());
+  const [restored, setRestored]   = useState(false);
+
+  useEffect(() => {
+    setDismissed(loadIds('dismissed'));
+    setReadSet(loadIds('read'));
+    setRestored(true);
+  }, []);
+
+  useEffect(() => {
+    if (!restored) return;
+    try {
+      localStorage.setItem(STORE_KEY, JSON.stringify({
+        read: Array.from(readSet).slice(-500), dismissed: Array.from(dismissed).slice(-500),
+      }));
+    } catch { /* storage unavailable: acknowledgements last for this visit only */ }
+  }, [readSet, dismissed, restored]);
 
   const { data, isLoading, mutate } = useSWR(
     'alerts',

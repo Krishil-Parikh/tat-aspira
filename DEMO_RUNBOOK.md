@@ -46,9 +46,14 @@ at() { date -u -d "+${1:-0} minutes" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u 
 T0=$(at 0)
 
 curl -s $API/health; echo
+
+# Log in once as admin; the journey and dashboard reads below send this session cookie.
+JAR=$(mktemp)
+curl -s -c "$JAR" -X POST $API/api/login -H 'Content-Type: application/json'   -d '{"email":"admin@aspira.com","password":"aspira123"}'; echo
 ```
 
 `at 90` = the time 90 minutes from now (used to stage receipts at different labs).
+Webhooks (`POST /api/webhook`) need no login; the read calls use `-b "$JAR"`.
 
 ### Demo lab network (from `init_demo.py`)
 
@@ -98,7 +103,7 @@ EOF
 **1c. Show it** — collected at SHOBHA, both tests processed at SHOBHA, one slot, one ETA.
 
 ```bash
-curl -s $API/api/demo/journey/${B}01; echo
+curl -s -b "$JAR" $API/api/demo/journey/${B}01; echo
 ```
 
 ---
@@ -133,7 +138,7 @@ EOF
 **2c. Show it** — collected at TRUECARE, processed at SHOBHA, arrival 45 min after collection.
 
 ```bash
-curl -s $API/api/demo/journey/${B}02; echo
+curl -s -b "$JAR" $API/api/demo/journey/${B}02; echo
 ```
 
 ---
@@ -166,7 +171,7 @@ curl -s -X POST $API/api/webhook -H 'Content-Type: application/json' -d @- <<EOF
 {"webhook_type":"SAMPLE_RECEIVED","billId":${B}03,"sampleId":"HOC-${B}03",
  "labId":1003,"accessionDate":"$(at 60)","CentreReportId":[${B}0301]}
 EOF
-curl -s $API/api/demo/journey/${B}03; echo
+curl -s -b "$JAR" $API/api/demo/journey/${B}03; echo
 ```
 
 **3c. Kharghar receives the LFT (+2 h), NM the Thyroid (+3 h), OS the Molecular (+4 h)**
@@ -190,7 +195,7 @@ EOF
 `sample_eta_end` is the slowest lab.
 
 ```bash
-curl -s $API/api/demo/journey/${B}03; echo
+curl -s -b "$JAR" $API/api/demo/journey/${B}03; echo
 ```
 
 **3e. Labs report results one by one** — the sample completes only after the last lab reports
@@ -201,11 +206,11 @@ curl -s -X POST $API/api/webhook -H 'Content-Type: application/json' -d @- <<EOF
 {"webhook_type":"REPORT_SUBMIT","billId":${B}03,"labReportId":$R,"reportDate":"$(at 300)","isSigned":1}
 EOF
 done
-curl -s $API/api/demo/journey/${B}03; echo      # sample: partially_complete
+curl -s -b "$JAR" $API/api/demo/journey/${B}03; echo      # sample: partially_complete
 curl -s -X POST $API/api/webhook -H 'Content-Type: application/json' -d @- <<EOF; echo
 {"webhook_type":"REPORT_SUBMIT","billId":${B}03,"labReportId":${B}0304,"reportDate":"$(at 360)","isSigned":1}
 EOF
-curl -s $API/api/demo/journey/${B}03; echo      # sample + bill: completed
+curl -s -b "$JAR" $API/api/demo/journey/${B}03; echo      # sample + bill: completed
 ```
 
 ---
@@ -232,12 +237,12 @@ curl -s -X POST $API/api/webhook -H 'Content-Type: application/json' -d @- <<EOF
 {"webhook_type":"SAMPLE_RECEIVED","billId":${B}04,"sampleId":"HOC-${B}04",
  "labId":1003,"accessionDate":"$(at 60)","CentreReportId":[${B}0401,${B}0402]}
 EOF
-curl -s $API/api/demo/journey/${B}04; echo      # both at SHOBHA
+curl -s -b "$JAR" $API/api/demo/journey/${B}04; echo      # both at SHOBHA
 curl -s -X POST $API/api/webhook -H 'Content-Type: application/json' -d @- <<EOF; echo
 {"webhook_type":"SAMPLE_RECEIVED","billId":${B}04,"sampleId":"HOC-${B}04",
  "labId":1004,"accessionDate":"$(at 150)","CentreReportId":[${B}0402]}
 EOF
-curl -s $API/api/demo/journey/${B}04; echo      # LFT now at KHARGHAR
+curl -s -b "$JAR" $API/api/demo/journey/${B}04; echo      # LFT now at KHARGHAR
 ```
 
 ### E2 — Two tubes on one bill, received at different labs
@@ -261,7 +266,7 @@ curl -s -X POST $API/api/webhook -H 'Content-Type: application/json' -d @- <<EOF
 {"webhook_type":"SAMPLE_RECEIVED","billId":${B}05,"sampleId":"SST-${B}05",
  "labId":1002,"accessionDate":"$(at 70)","CentreReportId":[${B}0502]}
 EOF
-curl -s $API/api/demo/journey/${B}05; echo      # two samples, two labs
+curl -s -b "$JAR" $API/api/demo/journey/${B}05; echo      # two samples, two labs
 ```
 
 ### E3 — Duplicate delivery is ignored
@@ -283,12 +288,12 @@ curl -s -X POST $API/api/webhook -H 'Content-Type: application/json' -d @- <<EOF
 {"webhook_type":"SAMPLE_REDRAWN","billId":${B}01,"sampleId":"SHB-${B}01",
  "redrawReason":"Haemolysed","newCollectionTime":"$(at 90)"}
 EOF
-curl -s $API/api/demo/journey/${B}01; echo      # cycle 1 invalidated, cycle 2 pending
+curl -s -b "$JAR" $API/api/demo/journey/${B}01; echo      # cycle 1 invalidated, cycle 2 pending
 curl -s -X POST $API/api/webhook -H 'Content-Type: application/json' -d @- <<EOF; echo
 {"webhook_type":"SAMPLE_RECEIVED","billId":${B}01,"sampleId":"SHB-${B}01",
  "labId":1003,"accessionDate":"$(at 100)","CentreReportId":[${B}0101,${B}0102]}
 EOF
-curl -s $API/api/demo/journey/${B}01; echo      # cycle 2 routed and slotted
+curl -s -b "$JAR" $API/api/demo/journey/${B}01; echo      # cycle 2 routed and slotted
 ```
 
 ### E5 — Sample sent to an external lab
@@ -298,7 +303,7 @@ curl -s -X POST $API/api/webhook -H 'Content-Type: application/json' -d @- <<EOF
 {"webhook_type":"SAMPLE_SENT_TO_EXTERNAL","billId":${B}02,"sampleId":"TRU-${B}02",
  "externalLabName":"Metropolis Reference Lab","sentTime":"$(at 60)"}
 EOF
-curl -s $API/api/demo/journey/${B}02; echo      # assignment=outsourced, vendor ETA kept
+curl -s -b "$JAR" $API/api/demo/journey/${B}02; echo      # assignment=outsourced, vendor ETA kept
 ```
 
 ---
@@ -320,7 +325,7 @@ Times are UTC.
 ## Other useful reads
 
 ```bash
-curl -s "$API/api/samples?limit=20"; echo        # recent samples
-curl -s $API/api/labs; echo                       # labs with internal ids
-curl -s $API/api/dashboard/admin; echo            # admin dashboard numbers
+curl -s -b "$JAR" "$API/api/samples?limit=20"; echo        # recent samples
+curl -s -b "$JAR" $API/api/labs; echo                       # labs with internal ids
+curl -s -b "$JAR" $API/api/dashboard/admin; echo            # admin dashboard numbers
 ```

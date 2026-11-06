@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from typing import Dict, Any, Optional
 from app import pg_database as pgdb
 from app.core.auth import get_current_user, require_role, UserSession
-from app.pg_database import _pool
+
 
 # Create admin router
 admin_router = APIRouter(
@@ -20,6 +20,63 @@ admin_router = APIRouter(
 async def admin_health():
     """Admin health check endpoint."""
     return {"status": "ok", "admin": "active"}
+
+@admin_router.get("/system-status")
+async def admin_system_status():
+    """Live health for the System Status page: database, Redis, and the webhook pipeline."""
+    import asyncio
+    import time
+    from config.settings import cfg
+
+    db = {"ok": False}
+    try:
+        t0 = time.perf_counter()
+        await pgdb._pool.fetchval("SELECT 1")
+        db = {"ok": True, "latency_ms": round((time.perf_counter() - t0) * 1000, 1)}
+    except Exception as exc:  # report, don't fail the page
+        db = {"ok": False, "error": str(exc)[:200]}
+
+    redis_status = {"ok": False}
+    try:
+        from app.core.hot_cache import _redis
+        t0 = time.perf_counter()
+        await asyncio.to_thread(lambda: _redis().ping())
+        redis_status = {"ok": True, "latency_ms": round((time.perf_counter() - t0) * 1000, 1)}
+    except Exception as exc:
+        redis_status = {"ok": False, "error": str(exc)[:200]}
+
+    pipeline = {}
+    if db["ok"]:
+        row = await pgdb._pool.fetchrow("""
+            SELECT
+              COUNT(*) FILTER (WHERE status IN ('received','processing'))      AS waiting,
+              COUNT(*) FILTER (WHERE status = 'failed')                        AS failed,
+              COUNT(*) FILTER (WHERE status = 'awaiting_reconciliation')       AS awaiting_reconciliation,
+              COUNT(*) FILTER (WHERE status = 'processed'
+                                 AND created_at >= NOW() - INTERVAL '24 hours') AS processed_24h,
+              MAX(processed_at)                                                AS last_processed_at
+            FROM tat_webhook_event
+        """)
+        pipeline = dict(row)
+        pipeline["last_processed_at"] = (pipeline["last_processed_at"].isoformat()
+                                         if pipeline["last_processed_at"] else None)
+        recent = await pgdb._pool.fetch("""
+            SELECT id, webhook_type, bill_id, error_message, created_at AS received_at
+            FROM tat_webhook_event WHERE status = 'failed'
+            ORDER BY id DESC LIMIT 5
+        """)
+        pipeline["recent_failures"] = [
+            {**dict(r), "received_at": r["received_at"].isoformat() if r["received_at"] else None}
+            for r in recent
+        ]
+
+    return {
+        "api": {"ok": True, "version": "2.0.0", "environment": cfg.APP_ENV, "demo_mode": cfg.DEMO_MODE},
+        "database": db,
+        "redis": redis_status,
+        "webhooks": pipeline,
+    }
+
 
 @admin_router.get("/stats")
 async def admin_stats():
@@ -63,12 +120,12 @@ class EdosCreate(BaseModel):
 
 @admin_router.post("/labs/{lab_id}/availability")
 async def update_lab_availability(lab_id: int, req: LabAvailabilityUpdate, user: UserSession = Depends(require_role(["admin", "super_admin"]))):
-    lab = await _pool.fetchrow("SELECT id, lab_name FROM tat_lab WHERE id = $1", lab_id)
+    lab = await pgdb._pool.fetchrow("SELECT id, lab_name FROM tat_lab WHERE id = $1", lab_id)
     if not lab:
         raise HTTPException(404, f"Lab {lab_id} not found")
 
     availability = 1 if req.is_active else 0
-    await _pool.execute(
+    await pgdb._pool.execute(
         """
         UPDATE tat_lab
         SET is_active = $1,
@@ -82,7 +139,7 @@ async def update_lab_availability(lab_id: int, req: LabAvailabilityUpdate, user:
         req.reason,
         lab_id,
     )
-    await _pool.execute(
+    await pgdb._pool.execute(
         """
         INSERT INTO tat_log (lab_id, event_type, triggered_by, notes, event_timestamp)
         VALUES ($1, 'lab_availability_changed', $2, $3, CURRENT_TIMESTAMP)
@@ -104,14 +161,14 @@ async def update_lab_availability(lab_id: int, req: LabAvailabilityUpdate, user:
 @admin_router.get("/capabilities")
 async def list_capabilities():
     """List all registered lab capabilities."""
-    rows = await _pool.fetch("SELECT * FROM tat_lab_capability ORDER BY id ASC")
+    rows = await pgdb._pool.fetch("SELECT * FROM tat_lab_capability ORDER BY id ASC")
     return {"capabilities": [dict(r) for r in rows]}
 
 @admin_router.post("/capabilities")
 async def create_capability(req: CapabilityCreate):
     """Add a new diagnostic department capability to a lab."""
     try:
-        val = await _pool.fetchval(
+        val = await pgdb._pool.fetchval(
             """INSERT INTO tat_lab_capability (lab_id, department_id, department_name, test_code)
                VALUES ($1, $2, $3, $4)
                RETURNING id""",
@@ -124,7 +181,7 @@ async def create_capability(req: CapabilityCreate):
 @admin_router.delete("/capabilities/{id}")
 async def delete_capability(id: int):
     """Remove a lab capability."""
-    res = await _pool.execute("DELETE FROM tat_lab_capability WHERE id = $1", id)
+    res = await pgdb._pool.execute("DELETE FROM tat_lab_capability WHERE id = $1", id)
     return {"status": "success", "message": res}
 
 
@@ -133,14 +190,14 @@ async def delete_capability(id: int):
 @admin_router.get("/routing")
 async def list_routing():
     """List all global test routing rules."""
-    rows = await _pool.fetch("SELECT * FROM tat_test_routing ORDER BY id ASC")
+    rows = await pgdb._pool.fetch("SELECT * FROM tat_test_routing ORDER BY id ASC")
     return {"routing_rules": [dict(r) for r in rows]}
 
 @admin_router.post("/routing")
 async def create_routing_rule(req: RoutingCreate):
     """Create or update a global test routing rule."""
     try:
-        val = await _pool.fetchval(
+        val = await pgdb._pool.fetchval(
             """INSERT INTO tat_test_routing (test_code, department_id, processing_lab_id, notes)
                VALUES ($1, $2, $3, $4)
                ON CONFLICT (test_code, department_id) DO UPDATE
@@ -157,7 +214,7 @@ async def create_routing_rule(req: RoutingCreate):
 @admin_router.delete("/routing/{id}")
 async def delete_routing_rule(id: int):
     """Delete a test routing rule."""
-    res = await _pool.execute("DELETE FROM tat_test_routing WHERE id = $1", id)
+    res = await pgdb._pool.execute("DELETE FROM tat_test_routing WHERE id = $1", id)
     return {"status": "success", "message": res}
 
 
@@ -166,14 +223,14 @@ async def delete_routing_rule(id: int):
 @admin_router.get("/edos")
 async def list_edos_configs():
     """List all per-lab EDOS test configurations."""
-    rows = await _pool.fetch("SELECT * FROM tat_lab_edos ORDER BY id ASC")
+    rows = await pgdb._pool.fetch("SELECT * FROM tat_lab_edos ORDER BY id ASC")
     return {"edos_configs": [dict(r) for r in rows]}
 
 @admin_router.post("/edos")
 async def create_edos_config(req: EdosCreate):
     """Create or update a lab-specific EDOS configuration for a test."""
     try:
-        val = await _pool.fetchval(
+        val = await pgdb._pool.fetchval(
             """INSERT INTO tat_lab_edos 
                (lab_id, test_code, department_id, department_name, processing_time_mins, 
                 committed_tat_hours, processing_mode, is_outsourced, outsource_vendor_name, 
@@ -202,7 +259,7 @@ async def create_edos_config(req: EdosCreate):
 @admin_router.delete("/edos/{id}")
 async def delete_edos_config(id: int):
     """Remove a lab-specific EDOS configuration."""
-    res = await _pool.execute("DELETE FROM tat_lab_edos WHERE id = $1", id)
+    res = await pgdb._pool.execute("DELETE FROM tat_lab_edos WHERE id = $1", id)
     return {"status": "success", "message": res}
 
 

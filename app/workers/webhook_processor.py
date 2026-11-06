@@ -373,7 +373,7 @@ def _process_test_completion(cur, event_id: int, ti_id: int, sample_id: int, bil
             report_date=%s, approval_date=%s, result=%s, result_time=%s,
             updated_at=CURRENT_TIMESTAMP
         WHERE id=%s
-    """, (event_id, report_date, approval_date, result_val, now, ti_id))
+    """, (event_id, report_date, approval_date, result_val, report_date or now, ti_id))
     # Calculate three-tier TAT
     tat_metrics = _calculate_three_tier_tat(cur, ti_id, sample_id, bill_id, report_date or now)
     # Update SLA record with actual TAT metrics
@@ -751,8 +751,10 @@ def _handle_bill_update(cur, event: Dict, payload: Dict) -> None:
         )
         return
     bill_id = row["id"]
-    # Ensure the bill metadata and tests are up to date with the incoming payload.
-    _handle_bill_generate(cur, event, payload)
+    # Ensure the bill metadata and tests are up to date with the incoming payload. A status-only
+    # update carries no tests; running it through BILL_GENERATE would add an empty sample.
+    if payload.get("labReportDetails") or payload.get("testDetails") or payload.get("samples"):
+        _handle_bill_generate(cur, event, payload)
     cur.execute("""
         UPDATE tat_bill SET bill_status_type='active', bill_update_time=CURRENT_TIMESTAMP,
             updated_at=CURRENT_TIMESTAMP
@@ -811,14 +813,12 @@ def _handle_bill_cancel(cur, event: Dict, payload: Dict) -> None:
             "event_type": "sample_cancelled", "ts": _now(),
             "webhook_event_id": event_id, "notes": reason,
         })
-        # Queue unexpected dismissal alert
-        from app.services.alert_service import _log_alert, _create_db_alert
-        alert_type = "unexpected_dismissal"
-        severity = "high"
-        message = f"Sample {sample_id} dismissed: {reason}"
-        _log_alert(cur, alert_type, sample_id, bill_id, {"reason": reason}, notes=reason)
-        _create_db_alert(cur, bill_id=bill_id, sample_id=sample_id, test_instance_id=None, lab_id=None, alert_type=alert_type, severity=severity, message=message)
-        push_sample_to_cache(cur, sample_id)
+        # Alert only: tat_log.event_type is the log_event_t enum, which has no
+        # 'unexpected_dismissal' value (logging it there rolled back the whole cancel).
+        from app.services.alert_service import _create_db_alert
+        _create_db_alert(cur, bill_id=bill_id, sample_id=sample_id, test_instance_id=None, lab_id=None,
+                         alert_type="unexpected_dismissal", severity="high",
+                         message=f"Bill cancelled, sample {sample_id} dismissed: {reason}")
     cur.execute("""
         UPDATE tat_test_instance
         SET status='cancelled', updated_at=CURRENT_TIMESTAMP
@@ -829,14 +829,8 @@ def _handle_bill_cancel(cur, event: Dict, payload: Dict) -> None:
         SET status='cancelled', updated_at=CURRENT_TIMESTAMP
         WHERE bill_id=%s AND status NOT IN ('completed','cancelled','skipped')
     """, (bill_id,))
-    cur.execute("SELECT id FROM tat_sample WHERE bill_id=%s LIMIT 1", (bill_id,))
-    srow = cur.fetchone()
-    if srow:
-        _log(cur, {
-            "sample_id": srow["id"], "bill_id": bill_id,
-            "event_type": "sample_cancelled", "ts": _now(),
-            "webhook_event_id": event_id, "notes": reason,
-        })
+    cur.execute("SELECT id FROM tat_sample WHERE bill_id=%s", (bill_id,))
+    for srow in cur.fetchall():
         push_sample_to_cache(cur, srow["id"])
     logger.info("[BILL_CANCEL] bill_id=%d", bill_id)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1225,6 +1219,16 @@ def _handle_sample_received(cur, event: Dict, payload: Dict) -> None:
     if not is_valid:
         logger.warning("[STATE_MACHINE] Invalid sample transition in SAMPLE_RECEIVED: %s", error_msg)
     webhook_lab_id = _receipt_lab_id(cur, payload)
+    named_lab = payload.get("internalLabId") or payload.get("labId")
+    if webhook_lab_id is None and named_lab not in (None, "", 0, {}):
+        # A receipt at a lab missing from tat_lab would otherwise be routed by capability and
+        # overwrite the arrival time; leave the sample as it is and flag the event.
+        logger.warning("[SAMPLE_RECEIVED] unknown lab %r for sample_id=%d", named_lab, sample_id)
+        cur.execute(
+            "UPDATE tat_webhook_event SET status='failed', error_message=%s WHERE id=%s",
+            (f"Receiving lab {named_lab!r} is not configured in tat_lab", event_id),
+        )
+        return
     # The first receipt is the sample's receipt. Each later receipt (another lab in the
     # chain, or a second tube) is recorded per lab on its queue entry / ETA records.
     cur.execute("""
@@ -1332,6 +1336,18 @@ def _handle_sample_received(cur, event: Dict, payload: Dict) -> None:
             SET status = CASE WHEN status='partially_complete' THEN status ELSE 'arrived' END
             WHERE id=%s
         """, (sample_id,))
+    # The sample's lab is the lab its tests run at (one lab), so views that show a single
+    # lab don't keep the provisional lab chosen at bill time.
+    cur.execute("""
+        UPDATE tat_sample s SET assigned_lab_id = x.lab_id, routing_reason = 'webhook_received_at'
+        FROM (
+            SELECT MIN(processing_lab_id) AS lab_id FROM tat_test_instance
+            WHERE sample_id=%s AND is_current_cycle=1 AND processing_lab_id IS NOT NULL
+              AND status NOT IN ('cancelled','invalidated')
+            HAVING COUNT(DISTINCT processing_lab_id) = 1
+        ) x
+        WHERE s.id=%s AND s.assigned_lab_id IS DISTINCT FROM x.lab_id
+    """, (sample_id, sample_id))
     # ── Per-lab batch slot + ETA ──────────────────────────────────────────────
     _schedule_lab_groups(cur, sample_id, bill_id, lab_groups, received_time, collected_at,
                          priority, tat_category, event_id)
@@ -1971,25 +1987,34 @@ def _check_sample_completion(cur, sample_id: int, bill_id: int, event_id: int) -
     cur.execute("""
         WITH counts AS (
             SELECT
-                COUNT(*) FILTER (WHERE status != 'cancelled') AS active_count,
-                COUNT(*) FILTER (WHERE status IN ('completed', 'cancelled')) AS done_count,
+                COUNT(*) FILTER (WHERE status NOT IN ('completed', 'cancelled')) AS open_count,
                 COUNT(*) FILTER (WHERE status = 'completed') AS completed_count
             FROM tat_test_instance
             WHERE sample_id=%s AND is_current_cycle=1   -- a redraw's invalidated cycle never completes
-        )
+        ),
+        prev AS (SELECT status AS old_status FROM tat_sample WHERE id=%s)   -- pre-update snapshot
         UPDATE tat_sample s
         SET completed_tests = (SELECT completed_count FROM counts),
+            -- every test cancelled -> cancelled; nothing left open -> completed (cancelled
+            -- tests don't hold a sample open); otherwise partially complete once one is done
             status = CASE
-                WHEN (SELECT active_count FROM counts) = (SELECT done_count FROM counts)
+                WHEN (SELECT open_count FROM counts) = 0 AND (SELECT completed_count FROM counts) = 0
+                    THEN 'cancelled'
+                WHEN (SELECT open_count FROM counts) = 0
                     THEN 'completed'
-                ELSE 'partially_complete'
+                WHEN (SELECT completed_count FROM counts) > 0
+                    THEN 'partially_complete'
+                ELSE s.status
             END::sample_status_t,
             updated_at = %s
+        FROM prev
         WHERE s.id = %s
-        RETURNING status
-    """, (sample_id, now, sample_id))
+        RETURNING s.status, prev.old_status
+    """, (sample_id, sample_id, now, sample_id))
     row = cur.fetchone()
-    if row and row.get("status") == "completed":
+    # Only the transition into 'completed' counts towards the bill (a later REPORT_PDF or
+    # signed report for an already-completed sample used to count it again).
+    if row and row.get("status") == "completed" and row.get("old_status") != "completed":
         # Sample was marked complete (all tests done)
         cur.execute("""
             UPDATE tat_bill

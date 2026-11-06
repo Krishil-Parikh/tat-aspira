@@ -91,7 +91,7 @@ export default function LogisticsPage() {
       {/* Stats Row */}
       <div className="grid grid-cols-3 gap-4">
         {[
-          { label: 'Awaiting Pickup', value: queue.filter((s: any) => s.status === 'routed' || s.status === 'pending').length, icon: Package, color: 'text-amber-500' },
+          { label: 'Awaiting Pickup', value: queue.filter((s: any) => s.status === 'pending').length, icon: Package, color: 'text-amber-500' },
           { label: 'In Transit', value: queue.filter((s: any) => s.status === 'in_transit').length, icon: Truck, color: 'text-primary' },
           { label: 'Delivered Today', value: queue.filter((s: any) => s.status === 'arrived').length, icon: CheckCircle2, color: 'text-success-text' },
         ].map((stat) => (
@@ -170,7 +170,11 @@ export default function LogisticsPage() {
 
                   <div className="flex items-center gap-3">
                     {/* Delivery lab selector */}
-                    {sample.status !== 'in_transit' ? (
+                    {sample.status === 'arrived' ? (
+                      <span className="text-[10px] font-black uppercase tracking-widest text-success-text flex items-center gap-2">
+                        <CheckCircle2 size={14} /> Delivered{sample.drop_location ? ` · ${sample.drop_location}` : ''}
+                      </span>
+                    ) : sample.status !== 'in_transit' ? (
                       <button
                         suppressHydrationWarning
                         disabled={isLoading_}

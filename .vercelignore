@@ -1,0 +1,19 @@
+# Vercel deploys only the Next.js dashboard; keep secrets and the Python backend out.
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.pyc
+app/**/*.py
+config/
+database/
+deploy/
+edos.csv
+requirements.txt
+Procfile
+render.yaml
+*.docx
+.next/
+node_modules/

@@ -22,9 +22,9 @@ function getLabId(): number {
 }
 
 const TEST_STATUS_FLOW: Record<string, { next: string; label: string; color: string }> = {
-  pending:    { next: 'in_queue',    label: 'Accept to Queue',  color: 'bg-surface-low text-muted' },
-  in_queue:   { next: 'processing',  label: 'Start Processing', color: 'bg-amber-500/10 text-amber-500' },
-  processing: { next: 'completed',   label: 'Mark Complete',    color: 'bg-primary/10 text-primary' },
+  // Test statuses the API stores (test_status_t): pending -> processing -> completed.
+  pending:    { next: 'processing',  label: 'Start Processing', color: 'bg-surface-low text-muted' },
+  processing: { next: 'completed',   label: 'Submit Result',    color: 'bg-primary/10 text-primary' },
 };
 
 export default function LabQueuePage() {
@@ -145,7 +145,7 @@ export default function LabQueuePage() {
       <div className="grid grid-cols-4 gap-4">
         {[
           { label: 'Total Assigned', value: mounted ? workItems.length : '...', color: 'text-foreground' },
-          { label: 'In Queue', value: mounted ? workItems.filter((t: any) => t.test_status === 'in_queue').length : '...', color: 'text-amber-500' },
+          { label: 'Waiting', value: mounted ? workItems.filter((t: any) => t.test_status === 'pending').length : '...', color: 'text-amber-500' },
           { label: 'Processing', value: mounted ? workItems.filter((t: any) => t.test_status === 'processing').length : '...', color: 'text-primary' },
           { label: 'TAT Breaches', value: mounted ? workItems.filter((t: any) => t.is_tat_breached).length : '...', color: 'text-red-500' },
         ].map(s => (

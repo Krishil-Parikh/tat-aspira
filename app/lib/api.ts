@@ -2,7 +2,10 @@
  * app/lib/api.ts
  * ─────────────────────────────────────────────────────────────────────────────
  * Centralised fetch helpers for the Aspira TAT frontend.
- * All calls go to NEXT_PUBLIC_API_URL (default: http://localhost:8000).
+ * Calls go to NEXT_PUBLIC_API_URL when it is set (Docker deploy: the backend's public
+ * address). Otherwise they are relative (/api/...) and next.config.js rewrites them to the
+ * backend (NEXT_PUBLIC_BACKEND_URL), so on Vercel the login cookie belongs to the dashboard's
+ * own domain instead of being a blocked third-party cookie from the backend's domain.
  *
  * Naming convention:  fetch*   → GET
  *                     confirm* → POST side-effect (logistics)
@@ -11,7 +14,7 @@
  *                     submit*  → POST result upload
  */
 
-const BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
+const BASE = process.env.NEXT_PUBLIC_API_URL || '';
 
 // ─── Generic helper ───────────────────────────────────────────────────────────
 
@@ -24,9 +27,24 @@ async function api<T = any>(
     headers: { 'Content-Type': 'application/json', ...(options?.headers ?? {}) },
     ...options,
   });
+  // Session missing or expired (or an old client-only login): clear the UI hints and go
+  // back to the login page instead of leaving every panel empty.
+  if (res.status === 401 && path !== '/api/login' && typeof window !== 'undefined'
+      && !window.location.pathname.startsWith('/login')) {
+    for (const name of ['aspira_auth', 'aspira_role', 'aspira_lab_id', 'aspira_name', 'aspira_email']) {
+      document.cookie = `${name}=; path=/; expires=Thu, 01 Jan 1970 00:00:01 GMT`;
+    }
+    window.location.href = '/login';
+  }
   if (!res.ok) {
     const body = await res.text().catch(() => res.statusText);
-    throw new Error(body || `HTTP ${res.status}`);
+    let message = body;
+    try {
+      const detail = JSON.parse(body)?.detail;
+      if (typeof detail === 'string') message = detail;
+      else if (Array.isArray(detail)) message = detail.map((d: any) => d?.msg ?? String(d)).join('; ');
+    } catch { /* not JSON */ }
+    throw new Error(message || `HTTP ${res.status}`);
   }
   return res.json() as Promise<T>;
 }
@@ -49,6 +67,54 @@ export interface SamplesParams {
   limit?: number;
   offset?: number;
 }
+
+// ─── Auth ─────────────────────────────────────────────────────────────────────
+
+export interface SessionUser {
+  email: string;
+  role: 'admin' | 'lab' | 'logistics' | 'doctor';
+  lab_id: number | null;
+  full_name: string | null;
+}
+
+/** POST /api/login — sets the signed session cookies; returns the user from tat_user */
+export const login = (email: string, password: string) =>
+  api<SessionUser & { status: string }>('/api/login', {
+    method: 'POST',
+    body: JSON.stringify({ email, password }),
+  });
+
+/** POST /api/logout — clears the session cookies */
+export const logout = () => api('/api/logout', { method: 'POST' });
+
+// ─── System status ────────────────────────────────────────────────────────────
+
+/** GET /api/admin/system-status — live DB / Redis / webhook pipeline health (admin) */
+export const fetchSystemStatus = () => api<any>('/api/admin/system-status');
+
+// ─── Admit sample ─────────────────────────────────────────────────────────────
+
+export interface AdmitOptions {
+  tests: { test_code: string; test_name: string; department_name: string | null;
+           processing_time_mins: number | null; tat_hours: number | null }[];
+  labs: { id: number; lab_code: string; lab_name: string }[];
+}
+
+/** GET /api/admit-sample/options — routable tests + collection labs */
+export const fetchAdmitOptions = () => api<AdmitOptions>('/api/admit-sample/options');
+
+/** POST /api/admit-sample — registers the sample as a BILL_GENERATE event */
+export const admitSample = (body: {
+  patient_name: string; test_codes: string[]; collection_lab_id: number;
+  priority: 'URGENT' | 'HIGH' | 'NORMAL';
+}) =>
+  api<{ bill_id: number; accession_no: string; event_id: number; collection_lab: string; tests: string[] }>(
+    '/api/admit-sample', { method: 'POST', body: JSON.stringify(body) },
+  );
+
+/** GET /api/demo/journey/:billId — where each test of a bill is processed, with ETAs */
+export const fetchBillJourney = (externalBillId: number | string) =>
+  api<any>(`/api/demo/journey/${externalBillId}`);
 
 /** GET /api/samples — paginated sample list */
 export const fetchSamples = ({ status, limit = 50, offset = 0 }: SamplesParams = {}) => {

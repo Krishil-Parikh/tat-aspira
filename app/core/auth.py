@@ -6,9 +6,6 @@ from app import pg_database as pgdb
 
 logger = logging.getLogger("auth")
 
-# Demo mode: disable authentication if DEMO_MODE env var is set
-DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() == "true"
-
 class UserSession:
     def __init__(self, email: str, role: str, lab_id: Optional[int] = None, full_name: Optional[str] = None):
         self.email = email
@@ -36,35 +33,18 @@ def get_signature(email: str) -> str:
 
 async def get_current_user(request: Request) -> UserSession:
     """
-    Backend-Validated Authentication.
-    Reads 'aspira_email' and 'aspira_sig' from cookies.
-    Verifies signature against SECRET_KEY.
+    Backend-validated authentication, in every mode (DEMO_MODE included).
+    POST /api/login sets 'aspira_email' and 'aspira_sig' (HMAC of the email with SECRET_KEY);
+    role and lab come from tat_user, never from client-editable cookies.
     """
-    # Skip authentication for demo/testing purposes
-    # The X-Demo-Mode header is honoured only when the server itself runs in DEMO_MODE;
-    # on its own it used to let any client skip login, including in production.
-    if DEMO_MODE:
-        # In demo mode, respect the cookies set by the frontend UI
-        email = request.cookies.get("aspira_email", "demo@aspira.com")
-        role = normalize_role(request.cookies.get("aspira_role", "admin"))
-        lab_id_str = request.cookies.get("aspira_lab_id")
-        lab_id = int(lab_id_str) if lab_id_str else None
-        
-        return UserSession(
-            email=email,
-            role=role,
-            lab_id=lab_id,
-            full_name=email.split("@")[0]
-        )
-    
     email = request.cookies.get("aspira_email")
     sig = request.cookies.get("aspira_sig")
-    
+
     if not email or not sig:
         logger.warning("Auth failed: Missing session cookies")
         raise HTTPException(status_code=401, detail="Unauthorized: No active session")
-    
-    if sig != get_signature(email):
+
+    if not hmac.compare_digest(sig.encode(), get_signature(email).encode()):
         logger.error(f"Auth failed: Invalid signature for {email}")
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid session signature")
 
@@ -78,7 +58,7 @@ async def get_current_user(request: Request) -> UserSession:
         "SELECT email, role, lab_id, full_name FROM tat_user WHERE email = $1 AND is_active = 1",
         email
     )
-    
+
     if not user_row:
         logger.warning(f"Auth failed: User {email} not found or inactive")
         raise HTTPException(status_code=403, detail="Forbidden: Unauthorized personnel")

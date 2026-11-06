@@ -75,6 +75,24 @@ class Settings:
     DEFAULT_PROCESSING_TIME_MINS: int = int(os.getenv("DEFAULT_PROCESSING_TIME_MINS", "60"))
     ALLOW_DOCTOR_SAMPLE_CREATE: bool = os.getenv("ALLOW_DOCTOR_SAMPLE_CREATE", "false").lower() == "true"
     SECRET_KEY: str = os.getenv("SECRET_KEY", "aspira-dev-secret-123")
+    # ── Keep-alive (free hosting tiers that sleep when idle, e.g. Render) ─────
+    # The API pings its own public URL every KEEPALIVE_INTERVAL_MINS minutes between
+    # KEEPALIVE_START_HOUR and KEEPALIVE_END_HOUR (KEEPALIVE_TIMEZONE). Off when no URL is set;
+    # Render sets RENDER_EXTERNAL_URL for every web service.
+    KEEPALIVE_URL: str = os.getenv("KEEPALIVE_URL") or os.getenv("RENDER_EXTERNAL_URL", "")
+    KEEPALIVE_INTERVAL_MINS: int = int(os.getenv("KEEPALIVE_INTERVAL_MINS", "12"))
+    KEEPALIVE_START_HOUR: int = int(os.getenv("KEEPALIVE_START_HOUR", "8"))
+    KEEPALIVE_END_HOUR: int = int(os.getenv("KEEPALIVE_END_HOUR", "20"))
+    KEEPALIVE_TIMEZONE: str = os.getenv("KEEPALIVE_TIMEZONE", "Asia/Kolkata")
+
+    # Shared demo password for the seeded tat_user accounts (checked by POST /api/login only).
+    LOGIN_PASSWORD: str = os.getenv("LOGIN_PASSWORD", "aspira123")
+    # Browser origins allowed to call the API with cookies (comma-separated).
+    # tuple, not list: Settings is a dataclass and rejects mutable defaults at import time
+    CORS_ORIGINS: tuple = tuple(o.strip() for o in os.getenv(
+        "CORS_ORIGINS",
+        "http://localhost:3000,http://localhost:3001,http://51.20.173.132,http://51.20.173.132:3000",
+    ).split(",") if o.strip())
 
     # ── Demo mode ─────────────────────────────────────────────────────────────
     # Live demos without CrelioHealth: unsigned webhooks accepted, webhooks processed
@@ -92,6 +110,14 @@ cfg = Settings()
 
 if not cfg.DATABASE_URL:
     raise RuntimeError("DATABASE_URL is required. Set it to your Neon PostgreSQL connection string.")
+
+# Neon's copy-paste connection string ends in "&channel_binding=require"; asyncpg sends unknown
+# URL parameters to the server as settings, which Postgres rejects. Drop it (SSL stays required).
+_db = urlparse(cfg.DATABASE_URL)
+if "channel_binding" in _db.query:
+    from urllib.parse import parse_qsl, urlencode
+    _q = [(k, v) for k, v in parse_qsl(_db.query) if k != "channel_binding"]
+    cfg.DATABASE_URL = _db._replace(query=urlencode(_q)).geturl()
 
 if cfg.IS_PRODUCTION and not cfg.WEBHOOK_SHARED_SECRET:
     raise RuntimeError("WEBHOOK_SHARED_SECRET is required in production.")

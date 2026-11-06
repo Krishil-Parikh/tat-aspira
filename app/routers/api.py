@@ -11,13 +11,16 @@ Routers:
   /api/accession      — Legacy accession endpoint
 """
 from __future__ import annotations
+import hmac
 import logging
 from typing import Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Query, Response, Depends
 
 from app import pg_database as pgdb
-from app.core.auth import get_current_user, require_role, UserSession, get_signature
+from app.core.auth import get_current_user, require_role, UserSession, get_signature, normalize_role
+from config.settings import cfg
 from app.edos_loader import get_all_records, lookup_test, search_records
 from app.models import AccessionRequest, LoginRequest
 
@@ -367,29 +370,54 @@ async def create_accession(req: AccessionRequest):
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
 
+_SESSION_MAX_AGE = 86400  # 24 h
+
+
 @accession_router.post("/login", tags=["Auth"])
 async def login(req: LoginRequest, response: Response):
     """
-    Backend-verified login.
-    Hardcoded password for demo/v2 as per frontend logic.
-    In v3, this will check hashed passwords in tat_user.
+    Backend-verified login against tat_user (shared demo password, cfg.LOGIN_PASSWORD).
+    Sets the signed session (httpOnly aspira_email + aspira_sig) plus readable UI hints
+    (aspira_auth, aspira_role, aspira_lab_id, aspira_name) used by the Next.js middleware
+    and sidebar. The API never trusts the hints; it re-reads role/lab from tat_user.
     """
-    if req.password != "aspira123":
-        raise HTTPException(401, "Invalid password")
-    
-    # Verify user exists
+    email = (req.email or "").strip().lower()
+    if not hmac.compare_digest(req.password.encode(), cfg.LOGIN_PASSWORD.encode()):
+        raise HTTPException(401, "Invalid email or password")
+
     from app.pg_database import _pool
-    user = await _pool.fetchrow("SELECT email FROM tat_user WHERE email=$1 AND is_active=1", req.email)
+    user = await _pool.fetchrow(
+        "SELECT email, role, lab_id, full_name FROM tat_user WHERE lower(email)=$1 AND is_active=1", email
+    )
     if not user:
-        raise HTTPException(401, "User not found or inactive")
-    
-    # Set signed cookies
-    sig = get_signature(req.email)
-    response.set_cookie(key="aspira_email", value=req.email, httponly=True)
-    response.set_cookie(key="aspira_sig",   value=sig,       httponly=True)
-    response.set_cookie(key="aspira_auth",  value="true",     httponly=False) # for frontend compat
-    
-    return {"status": "success", "message": "Logged in successfully"}
+        raise HTTPException(401, "Invalid email or password")
+
+    role = normalize_role(user["role"])
+    opts = dict(max_age=_SESSION_MAX_AGE, path="/", samesite="lax")
+    response.set_cookie("aspira_email", user["email"], httponly=True, **opts)
+    response.set_cookie("aspira_sig", get_signature(user["email"]), httponly=True, **opts)
+    response.set_cookie("aspira_auth", "true", **opts)
+    response.set_cookie("aspira_role", role, **opts)
+    response.set_cookie("aspira_name", quote(user["full_name"] or user["email"]), **opts)
+    if user["lab_id"]:
+        response.set_cookie("aspira_lab_id", str(user["lab_id"]), **opts)
+    else:
+        response.delete_cookie("aspira_lab_id", path="/")
+
+    return {"status": "success", "email": user["email"], "role": role,
+            "lab_id": user["lab_id"], "full_name": user["full_name"]}
+
+
+@accession_router.post("/logout", tags=["Auth"])
+async def logout(response: Response):
+    for name in ("aspira_email", "aspira_sig", "aspira_auth", "aspira_role", "aspira_lab_id", "aspira_name"):
+        response.delete_cookie(name, path="/")
+    return {"status": "success"}
+
+
+@accession_router.get("/me", tags=["Auth"])
+async def me(user: UserSession = Depends(get_current_user)):
+    return {"email": user.email, "role": user.role, "lab_id": user.lab_id, "full_name": user.full_name}
 
 
 # ── New endpoints ─────────────────────────────────────────────────────────────
