@@ -37,6 +37,7 @@ from app.routers.api import (
     tests_router,
     test_tracking_router,
     accession_router,
+    auth_router,
 )
 from app.routers.admin import admin_router
 from app.routers.actions import actions_router
@@ -138,6 +139,7 @@ app.include_router(notif_router)
 app.include_router(tests_router)
 app.include_router(test_tracking_router)
 app.include_router(accession_router)
+app.include_router(auth_router)
 app.include_router(admin_router)      # Bug 2 Fix: GET /api/admin/*
 app.include_router(actions_router)
 app.include_router(dashboard_router)

@@ -350,6 +350,8 @@ async def get_tracked_test(test_id: int):
 
 # ── Accession (legacy manual entry) ──────────────────────────────────────────
 accession_router = APIRouter(prefix="/api", tags=["Accession"], dependencies=[Depends(get_current_user)])
+# Login/logout must be reachable without a session, so they are not on accession_router.
+auth_router = APIRouter(prefix="/api", tags=["Auth"])
 
 
 @accession_router.post("/accession")
@@ -373,7 +375,7 @@ async def create_accession(req: AccessionRequest):
 _SESSION_MAX_AGE = 86400  # 24 h
 
 
-@accession_router.post("/login", tags=["Auth"])
+@auth_router.post("/login")
 async def login(req: LoginRequest, response: Response):
     """
     Backend-verified login against tat_user (shared demo password, cfg.LOGIN_PASSWORD).
@@ -408,14 +410,14 @@ async def login(req: LoginRequest, response: Response):
             "lab_id": user["lab_id"], "full_name": user["full_name"]}
 
 
-@accession_router.post("/logout", tags=["Auth"])
+@auth_router.post("/logout")
 async def logout(response: Response):
     for name in ("aspira_email", "aspira_sig", "aspira_auth", "aspira_role", "aspira_lab_id", "aspira_name"):
         response.delete_cookie(name, path="/")
     return {"status": "success"}
 
 
-@accession_router.get("/me", tags=["Auth"])
+@auth_router.get("/me")
 async def me(user: UserSession = Depends(get_current_user)):
     return {"email": user.email, "role": user.role, "lab_id": user.lab_id, "full_name": user.full_name}
 
