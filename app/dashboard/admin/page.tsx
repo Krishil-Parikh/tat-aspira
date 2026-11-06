@@ -493,14 +493,17 @@ export default function AdminPage() {
           ) : (
             <div className="p-8 grid md:grid-cols-3 gap-6">
               {slaStats.map((row: any) => {
-                const compliance = row.total > 0 ? Math.round(((row.total - row.breached) / row.total) * 100) : 100;
+                // GET /api/stats/sla sends total_with_eta (samples that have an ETA), not total
+                const total = Number(row.total_with_eta ?? row.total ?? 0);
+                const breached = Number(row.breached ?? 0);
+                const compliance = total > 0 ? Math.round(((total - breached) / total) * 100) : 100;
                 return (
                   <div key={row.client_type} className="bg-surface-low rounded-2xl p-6">
                     <p className="text-[9px] font-black text-muted uppercase tracking-widest mb-2">{row.client_type}</p>
                     <p className={cn("text-4xl font-black font-technical", compliance >= 90 ? 'text-success-text' : compliance >= 70 ? 'text-amber-500' : 'text-red-500')}>
                       {compliance}%
                     </p>
-                    <p className="text-[10px] text-muted mt-2">{row.total} samples · {row.breached} breached</p>
+                    <p className="text-[10px] text-muted mt-2">{total} samples · {breached} breached</p>
                     <div className="w-full bg-surface-high rounded-full h-2 mt-3 overflow-hidden">
                       <div className={cn("h-full rounded-full", compliance >= 90 ? 'bg-success-bg' : compliance >= 70 ? 'bg-amber-500' : 'bg-red-500')} style={{ width: `${compliance}%` }} />
                     </div>
