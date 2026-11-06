@@ -47,7 +47,12 @@ async def get_sample_timeline(
         sample = await pgdb.get_sample(sample_id)
         if not sample:
             raise HTTPException(404, f"Sample {sample_id} not found")
-        if sample.get("assigned_lab_id") != user.lab_id:
+        # A split order has tests at several labs; any of them may see the sample.
+        runs_here = await pgdb._pool.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM tat_test_instance WHERE sample_id=$1 AND processing_lab_id=$2)",
+            sample_id, user.lab_id,
+        )
+        if sample.get("assigned_lab_id") != user.lab_id and not runs_here:
             raise HTTPException(403, "Forbidden: This sample is not assigned to your lab")
 
     timeline = await pgdb.get_sample_timeline(sample_id)
